@@ -31,7 +31,13 @@ class SignalingService {
   }
 
   // static const String _serverUrl = 'ws://localhost:8080/ws/signaling';
-  static const String _serverUrl = 'ws://192.168.43.188:8080/ws/signaling';
+  // static const String _serverUrl = 'ws://192.168.43.188:8080/ws/signaling';
+  // static const String _serverUrl =
+  //     'wss://watchtogether-server.onrender.com/ws/signaling';
+  // static const String _serverUrl =
+  //     'wss://watchtogether-server-ku71.onrender.com/ws/signaling';
+  static const String _serverUrl =
+      'wss://watchtogether-server-1.onrender.com/ws/signaling';
 
   void connect({
     required String roomId,
