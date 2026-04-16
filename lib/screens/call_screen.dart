@@ -121,22 +121,15 @@ class _CallScreenState extends State<CallScreen> {
       // ── Audio ────────────────────────────────────────────────────────────
       if (trackKind == 'audio') {
         if (_expectingScreenStream) {
-          // BUG 4 FIX: this audio arrived alongside a screen_start — it's
-          // the screen share audio (tab/system audio). Track it separately
-          // so we can stop it precisely on screen_off without killing mic audio.
-          if (_screenAudioStreamId == id) {
-            debugPrint('🔇 Screen audio already routed, skipping duplicate');
-            return;
-          }
+          if (_screenAudioStreamId == id) return;
           _screenAudioStreamId = id;
           setState(() => _audioRenderer.srcObject = stream);
           debugPrint('🔊 Screen audio → hidden renderer ($id)');
         } else {
-          // BUG 3 FIX: regular mic audio. Only route once per unique stream ID.
-          if (_audioStreamId == id) {
-            debugPrint('🔇 Mic audio already routed, skipping duplicate');
-            return;
-          }
+          // ✅ REMOVE the _audioStreamId == id early-return guard
+          // Renegotiation re-fires onTrack for mic with same stream ID,
+          // but _audioRenderer.srcObject may have been overwritten by
+          // screen audio in the meantime — always re-attach mic audio.
           _audioStreamId = id;
           setState(() => _audioRenderer.srcObject = stream);
           debugPrint('🔊 Mic audio → hidden renderer ($id)');
@@ -322,13 +315,18 @@ class _CallScreenState extends State<CallScreen> {
           setState(() {
             _mainRenderer.srcObject = null;
             _remoteScreenActive = false;
-            _expectingScreenStream = false; // stale-flag cleanup
+            _expectingScreenStream = false;
+            // Re-attach mic audio since screen audio may have overwritten it
+            if (_audioStreamId != null) {
+              // _audioRenderer will be re-set by the next onTrack re-fire
+              // from renegotiation — just null the screen audio guard
+            }
           });
           _screenStreamId = null;
           _screenAudioStreamId = null;
-          // _audioStreamId is intentionally NOT cleared here.
-          // _audioRenderer.srcObject is intentionally NOT nulled here.
-          // The mic stream stays attached so voice continues uninterrupted.
+          // _audioStreamId intentionally kept — forces re-route on next onTrack
+          _audioStreamId =
+              null; // ✅ clear so the dedup guard doesn't block re-attach
         }
         break;
     }
