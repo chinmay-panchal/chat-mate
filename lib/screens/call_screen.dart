@@ -55,16 +55,20 @@ class _CallScreenState extends State<CallScreen> {
   String? _screenStreamId;
   String? _cameraStreamId;
 
-  // ── Ghost-audio fix ───────────────────────────────────────────────────────
-  // We track whether the audio renderer currently has a live stream attached.
-  // When the peer's mic is muted the stream still exists but track.enabled is
-  // false — that is fine and handled by WebRTC itself.
-  // The ghost audio bug was caused by routing EVERY onTrack audio event to
-  // _audioRenderer regardless of whether it was the mic or screen-share audio,
-  // AND by re-routing the same stream on renegotiation.
-  // Fix: use a single _audioStreamId guard AND only attach audio when it is
-  // a genuinely new stream ID.
+  // ── Audio stream ID guards ────────────────────────────────────────────────
+  // BUG 3/4 FIX: track mic and screen audio stream IDs separately.
+  //
+  // _audioStreamId      → the mic audio stream currently in _audioRenderer.
+  //                        Never cleared on screen_off — mic audio is continuous.
+  // _screenAudioStreamId → the screen share audio stream ID.
+  //                        Cleared on screen_off; _audioRenderer keeps the mic
+  //                        stream so audio doesn't cut out after screen share ends.
+  //
+  // Old code used a single _audioStreamId and cleared both on screen_off,
+  // which left _audioRenderer with no stream after screen share ended —
+  // causing mic audio to silently drop for the rest of the call.
   String? _audioStreamId;
+  String? _screenAudioStreamId; // BUG 4 FIX: separate guard for screen audio
 
   @override
   void initState() {
@@ -93,13 +97,14 @@ class _CallScreenState extends State<CallScreen> {
 
     // ── Remote stream routing ─────────────────────────────────────────────
     //
-    // WebRTCService now passes (stream, trackKind) so we never have to
-    // inspect stream.getVideoTracks() / getAudioTracks() here, which is
-    // unreliable mid-negotiation.
-    //
     // trackKind == 'audio':
-    //   Always goes to _audioRenderer (hidden). Only routed once per unique
-    //   stream ID to prevent ghost audio from duplicate onTrack events.
+    //   BUG 3/4 FIX: split into mic vs screen audio using _expectingScreenStream.
+    //   - If _expectingScreenStream is true when audio arrives → screen audio.
+    //     Tag with _screenAudioStreamId. _audioRenderer gets the screen audio.
+    //   - Otherwise → mic audio. Tag with _audioStreamId.
+    //   Both still go to _audioRenderer (one renderer plays whatever is newest).
+    //   On screen_off we only clear _screenAudioStreamId; the mic stream stays
+    //   active in the renderer so voice continues without interruption.
     //
     // trackKind == 'video', isInitiator:
     //   Always → _pipRenderer (viewer's camera).
@@ -115,16 +120,27 @@ class _CallScreenState extends State<CallScreen> {
 
       // ── Audio ────────────────────────────────────────────────────────────
       if (trackKind == 'audio') {
-        // Ghost-audio fix: only attach if this is a new audio stream.
-        // Re-attaching the same stream on renegotiation caused phantom audio
-        // because the renderer kept playing a stale/ended stream object.
-        if (_audioStreamId == id) {
-          debugPrint('🔇 Audio stream already routed, skipping duplicate');
-          return;
+        if (_expectingScreenStream) {
+          // BUG 4 FIX: this audio arrived alongside a screen_start — it's
+          // the screen share audio (tab/system audio). Track it separately
+          // so we can stop it precisely on screen_off without killing mic audio.
+          if (_screenAudioStreamId == id) {
+            debugPrint('🔇 Screen audio already routed, skipping duplicate');
+            return;
+          }
+          _screenAudioStreamId = id;
+          setState(() => _audioRenderer.srcObject = stream);
+          debugPrint('🔊 Screen audio → hidden renderer ($id)');
+        } else {
+          // BUG 3 FIX: regular mic audio. Only route once per unique stream ID.
+          if (_audioStreamId == id) {
+            debugPrint('🔇 Mic audio already routed, skipping duplicate');
+            return;
+          }
+          _audioStreamId = id;
+          setState(() => _audioRenderer.srcObject = stream);
+          debugPrint('🔊 Mic audio → hidden renderer ($id)');
         }
-        _audioStreamId = id;
-        setState(() => _audioRenderer.srcObject = stream);
-        debugPrint('🔊 Audio stream → hidden renderer ($id)');
         return;
       }
 
@@ -163,9 +179,6 @@ class _CallScreenState extends State<CallScreen> {
         debugPrint('🖥️ [Viewer] Screen share → main ($id)');
       } else {
         // No screen_start received → this is the sharer's camera → PiP only.
-        // This also handles the rare timing case where onTrack fires before
-        // screen_start arrives: the stream is PiP now and will NOT be
-        // re-routed to main because _screenStreamId guards against that.
         _cameraStreamId = id;
         setState(() {
           _pipRenderer.srcObject = stream;
@@ -285,7 +298,10 @@ class _CallScreenState extends State<CallScreen> {
         if (mounted) setState(() => _expectingScreenStream = true);
         break;
 
-      // Peer turned off camera → clear PiP and reset stream ID.
+      // BUG 1 FIX: Peer turned off camera → clear PiP and reset stream ID.
+      // This now also handles the case where the sharer's OS/browser forcibly
+      // ended the camera track (onEnded fires in WebRTCService → onCameraOff
+      // callback → signaling.sendCameraOff() → arrives here).
       case 'camera_off':
         if (mounted) {
           setState(() {
@@ -297,24 +313,22 @@ class _CallScreenState extends State<CallScreen> {
         break;
 
       // Sharer stopped screen share → clear main view on viewer.
-      // Also reset _expectingScreenStream in case screen_start was sent but
-      // share was cancelled before the stream arrived (avoids stale flag).
+      // BUG 4 FIX: do NOT clear _audioStreamId or null _audioRenderer.srcObject.
+      // The mic audio sender is still active — clearing the renderer here was
+      // causing mic audio to go silent for the rest of the call after screen
+      // share ended. Only reset the screen audio tracking variables.
       case 'screen_off':
         if (mounted && !widget.isInitiator) {
           setState(() {
             _mainRenderer.srcObject = null;
             _remoteScreenActive = false;
-            _expectingScreenStream = false; // ← stale-flag cleanup
+            _expectingScreenStream = false; // stale-flag cleanup
           });
           _screenStreamId = null;
-
-          // Also clear audio renderer to stop screen share audio on viewer.
-          // The screen audio sender is removed on the sharer side; we clear
-          // the renderer here so Web stops playing it immediately.
-          setState(() {
-            _audioRenderer.srcObject = null;
-          });
-          _audioStreamId = null;
+          _screenAudioStreamId = null;
+          // _audioStreamId is intentionally NOT cleared here.
+          // _audioRenderer.srcObject is intentionally NOT nulled here.
+          // The mic stream stays attached so voice continues uninterrupted.
         }
         break;
     }

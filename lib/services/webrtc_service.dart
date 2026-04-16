@@ -30,8 +30,9 @@ class WebRTCService {
   final List<RTCIceCandidate> _pendingCandidates = [];
   bool _remoteDescriptionSet = false;
 
-  // Stored so _clearScreenTrack() removes exactly the screen audio sender
-  // and never accidentally removes the local mic sender.
+  // Stored so _clearScreenTrack() removes exactly the screen video/audio
+  // senders and never accidentally removes the local mic sender.
+  RTCRtpSender? _screenVideoSender; // BUG 2 FIX: store screen video sender ref
   RTCRtpSender? _screenAudioSender;
 
   String? _localMicTrackId;
@@ -67,6 +68,15 @@ class WebRTCService {
 
     _peerConnection!.onConnectionState = (state) {
       onConnectionState?.call(state);
+    };
+
+    // BUG 3 FIX: wire native negotiation needed event so renegotiation fires
+    // automatically when tracks are added/removed (e.g. camera, screen share).
+    // Previously this was only triggered manually, so the mic track added
+    // during initialize() was never properly renegotiated after offer/answer.
+    _peerConnection!.onRenegotiationNeeded = () {
+      debugPrint('🔄 Native renegotiation needed');
+      onNegotiationNeeded?.call();
     };
 
     await _initLocalMedia();
@@ -130,7 +140,13 @@ class WebRTCService {
   // ── Mic ──────────────────────────────────────────────────────────────────
   Future<void> toggleMicrophone() async {
     _micEnabled = !_micEnabled;
-    for (final track in _localStream?.getAudioTracks() ?? []) {
+    // BUG 3 FIX: guard against empty track list
+    final tracks = _localStream?.getAudioTracks() ?? [];
+    if (tracks.isEmpty) {
+      debugPrint('⚠️ No audio tracks to toggle');
+      return;
+    }
+    for (final track in tracks) {
       track.enabled = _micEnabled;
     }
     debugPrint('🎤 Mic ${_micEnabled ? "ON" : "OFF"}');
@@ -159,6 +175,19 @@ class WebRTCService {
       });
 
       final videoTrack = _cameraStream!.getVideoTracks().first;
+
+      // BUG 1 FIX: listen for external track-end (e.g. browser/OS kills camera)
+      // so we always send camera_off to the peer and clean up state.
+      videoTrack.onEnded = () {
+        debugPrint('📷 Camera track ended externally');
+        _cameraEnabled = false;
+        _cameraStream?.getTracks().forEach((t) => t.stop());
+        _cameraStream?.dispose();
+        _cameraStream = null;
+        onCameraOff?.call(); // → CallScreen sends camera_off to peer
+        onNegotiationNeeded?.call(); // renegotiate to remove the dead sender
+      };
+
       final senders = await _peerConnection!.getSenders();
       final videoSenders =
           senders.where((s) => s.track?.kind == 'video').toList();
@@ -211,26 +240,36 @@ class WebRTCService {
   // ── Screen share ─────────────────────────────────────────────────────────
   Future<void> startScreenShare() async {
     try {
+      // BUG 4 FIX: pass proper audio constraints so Chrome captures tab audio.
+      // suppressLocalAudioPlayback:false prevents Chrome from muting the tab
+      // for the sharer while sharing — without this the audio track exists but
+      // carries silence. echoCancellation/noiseSuppression must be false for
+      // system audio (they are designed for mic input, not loopback).
       _screenStream = await navigator.mediaDevices.getDisplayMedia({
         'video': {
           'width': {'max': 1920},
           'height': {'max': 1080},
           'frameRate': {'max': 15},
         },
-        'audio': true, // tab audio on Chrome; gracefully absent on mobile
+        'audio': {
+          'suppressLocalAudioPlayback': false,
+          'echoCancellation': false,
+          'noiseSuppression': false,
+          'sampleRate': 44100,
+        },
       });
 
       final screenVideoTrack = _screenStream!.getVideoTracks().first;
 
-      final senders = await _peerConnection!.getSenders();
-      final videoSenders =
-          senders.where((s) => s.track?.kind == 'video').toList();
-
-      if (videoSenders.isNotEmpty) {
-        await videoSenders.first.replaceTrack(screenVideoTrack);
-      } else {
-        await _peerConnection!.addTrack(screenVideoTrack, _screenStream!);
-      }
+      // BUG 2 FIX: always add screen share as a NEW sender — never reuse the
+      // camera sender via replaceTrack(). When replaceTrack is used the viewer
+      // receives the same stream ID as the camera stream, so the dedup guard
+      // in CallScreen routes it to _pipRenderer instead of _mainRenderer.
+      // A new addTrack() call gives a new stream ID, which combined with the
+      // screen_start signal correctly routes to _mainRenderer.
+      _screenVideoSender =
+          await _peerConnection!.addTrack(screenVideoTrack, _screenStream!);
+      debugPrint('🖥️ Screen video sender stored');
 
       // Store screen audio sender reference for precise removal on stop.
       final screenAudioTracks = _screenStream!.getAudioTracks();
@@ -246,6 +285,8 @@ class WebRTCService {
       _screenSharing = true;
       onNegotiationNeeded?.call();
 
+      // BUG 1 FIX (screen): also handle track-end for screen share so the
+      // sharer's UI updates and screen_off is sent if user stops via browser UI.
       screenVideoTrack.onEnded = () {
         _screenSharing = false;
         _clearScreenTrack();
@@ -268,11 +309,17 @@ class WebRTCService {
     _screenStream?.dispose();
     _screenStream = null;
 
-    final senders = await _peerConnection!.getSenders();
-    for (final sender in senders) {
-      if (sender.track?.kind == 'video') {
-        await sender.replaceTrack(null);
+    // BUG 2 FIX: remove screen video sender by stored reference, not by
+    // iterating all video senders — that could accidentally remove the camera
+    // sender if camera was also active during screen share.
+    if (_screenVideoSender != null) {
+      try {
+        await _peerConnection!.removeTrack(_screenVideoSender!);
+        debugPrint('🖥️ Screen video sender removed');
+      } catch (e) {
+        debugPrint('⚠️ removeTrack screenVideo: $e');
       }
+      _screenVideoSender = null;
     }
 
     // Remove screen audio sender by stored reference — never touches mic.
