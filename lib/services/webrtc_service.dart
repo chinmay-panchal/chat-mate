@@ -102,14 +102,30 @@ class WebRTCService {
 
   Future<RTCSessionDescription> createOffer() async {
     final offer = await _peerConnection!.createOffer(_offerSdpConstraints);
-    await _peerConnection!.setLocalDescription(offer);
-    return offer;
+    final boosted = _setVideoBandwidth(offer.sdp!, 4000); // 4 Mbps
+    final desc = RTCSessionDescription(boosted, 'offer');
+    await _peerConnection!.setLocalDescription(desc);
+    return desc;
   }
 
   Future<RTCSessionDescription> createAnswer() async {
     final answer = await _peerConnection!.createAnswer(_offerSdpConstraints);
-    await _peerConnection!.setLocalDescription(answer);
-    return answer;
+    final boosted = _setVideoBandwidth(answer.sdp!, 4000);
+    final desc = RTCSessionDescription(boosted, 'answer');
+    await _peerConnection!.setLocalDescription(desc);
+    return desc;
+  }
+
+  String _setVideoBandwidth(String sdp, int kbps) {
+    final lines = sdp.split('\r\n');
+    final result = <String>[];
+    for (final line in lines) {
+      result.add(line);
+      if (line.startsWith('m=video')) {
+        result.add('b=AS:$kbps');
+      }
+    }
+    return result.join('\r\n');
   }
 
   Future<void> setRemoteDescription(RTCSessionDescription desc) async {
@@ -245,11 +261,19 @@ class WebRTCService {
       // for the sharer while sharing — without this the audio track exists but
       // carries silence. echoCancellation/noiseSuppression must be false for
       // system audio (they are designed for mic input, not loopback).
+
+      // _screenStream = await navigator.mediaDevices.getDisplayMedia({
+      //   'video': {
+      //     'width': {'max': 1920},
+      //     'height': {'max': 1080},
+      //     'frameRate': {'max': 15},
+      //   },
+
       _screenStream = await navigator.mediaDevices.getDisplayMedia({
         'video': {
-          'width': {'max': 1920},
-          'height': {'max': 1080},
-          'frameRate': {'max': 15},
+          'width': {'ideal': 1280, 'max': 1280}, // drop from 1920
+          'height': {'ideal': 720, 'max': 720}, // drop from 1080
+          'frameRate': {'ideal': 30, 'max': 30}, // bump from 15
         },
         'audio': {
           'suppressLocalAudioPlayback': false,

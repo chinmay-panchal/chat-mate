@@ -511,7 +511,7 @@ class _CallScreenState extends State<CallScreen> {
         return RTCVideoView(
           _mainRenderer,
           objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-          filterQuality: FilterQuality.medium,
+          filterQuality: FilterQuality.low,
         );
       }
       if (_connected) {
