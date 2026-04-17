@@ -4,6 +4,8 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../services/webrtc_service.dart';
 import '../services/signaling_service.dart';
+import 'package:flutter/foundation.dart'; // for kIsWeb
+import 'dart:html' as html; // for html.window
 
 class CallScreen extends StatefulWidget {
   final String roomId;
@@ -371,6 +373,18 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   Future<void> _toggleScreenShare() async {
+    if (kIsWeb) {
+      // ignore: avoid_web_libraries_in_flutter
+      final userAgent = html.window.navigator.userAgent.toLowerCase();
+      final isMobile = userAgent.contains('iphone') ||
+          userAgent.contains('ipad') ||
+          userAgent.contains('android');
+      if (isMobile) {
+        _showMobileScreenShareUnsupported();
+        return;
+      }
+    }
+
     if (_screenSharing) {
       await _webrtc.stopScreenShare();
       setState(() => _screenSharing = false);
@@ -379,27 +393,103 @@ class _CallScreenState extends State<CallScreen> {
       final success = await _webrtc.startScreenShare();
 
       if (!success) {
-        // ✅ Screen share failed or got camera instead — cancel the
-        // screen_start signal by immediately sending screen_off so the
-        // viewer doesn't get stuck waiting with _expectingScreenStream=true
         _signaling.sendScreenOff();
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Screen sharing is not supported on this mobile browser. '
-                'Try Chrome on desktop.',
-              ),
-              duration: Duration(seconds: 4),
-            ),
-          );
-        }
+        if (mounted) _showMobileScreenShareUnsupported();
         return;
       }
 
       setState(() => _screenSharing = _webrtc.screenSharing);
     }
+  }
+
+  void _showMobileScreenShareUnsupported() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF141420),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Drag handle
+            Container(
+              width: 40,
+              height: 4,
+              margin: const EdgeInsets.only(bottom: 28),
+              decoration: BoxDecoration(
+                color: Colors.white12,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            // Icon
+            Container(
+              width: 64,
+              height: 64,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFF6C63FF).withOpacity(0.1),
+                border: Border.all(
+                  color: const Color(0xFF6C63FF).withOpacity(0.3),
+                  width: 1.5,
+                ),
+              ),
+              child: const Icon(
+                Icons.screen_share_rounded,
+                color: Color(0xFF6C63FF),
+                size: 28,
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              'Screen sharing unavailable',
+              style: GoogleFonts.spaceGrotesk(
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Mobile browsers don\'t support screen sharing.\nOpen this app on a desktop browser to share your screen.',
+              textAlign: TextAlign.center,
+              style: GoogleFonts.spaceGrotesk(
+                fontSize: 13,
+                color: Colors.white38,
+                height: 1.6,
+              ),
+            ),
+            const SizedBox(height: 28),
+            GestureDetector(
+              onTap: () => Navigator.of(context).pop(),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(14),
+                  color: const Color(0xFF6C63FF).withOpacity(0.15),
+                  border: Border.all(
+                    color: const Color(0xFF6C63FF).withOpacity(0.3),
+                    width: 1,
+                  ),
+                ),
+                child: Text(
+                  'Got it',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.spaceGrotesk(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: const Color(0xFF6C63FF),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _endCall() {
