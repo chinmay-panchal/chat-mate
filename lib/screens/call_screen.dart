@@ -375,9 +375,29 @@ class _CallScreenState extends State<CallScreen> {
       await _webrtc.stopScreenShare();
       setState(() => _screenSharing = false);
     } else {
-      // Send screen_start BEFORE renegotiation so viewer sets the flag first.
       _signaling.sendScreenStart();
-      await _webrtc.startScreenShare();
+      final success = await _webrtc.startScreenShare();
+
+      if (!success) {
+        // ✅ Screen share failed or got camera instead — cancel the
+        // screen_start signal by immediately sending screen_off so the
+        // viewer doesn't get stuck waiting with _expectingScreenStream=true
+        _signaling.sendScreenOff();
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Screen sharing is not supported on this mobile browser. '
+                'Try Chrome on desktop.',
+              ),
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+        return;
+      }
+
       setState(() => _screenSharing = _webrtc.screenSharing);
     }
   }

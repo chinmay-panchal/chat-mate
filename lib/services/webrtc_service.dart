@@ -254,26 +254,13 @@ class WebRTCService {
   }
 
   // ── Screen share ─────────────────────────────────────────────────────────
-  Future<void> startScreenShare() async {
+  Future<bool> startScreenShare() async {
     try {
-      // BUG 4 FIX: pass proper audio constraints so Chrome captures tab audio.
-      // suppressLocalAudioPlayback:false prevents Chrome from muting the tab
-      // for the sharer while sharing — without this the audio track exists but
-      // carries silence. echoCancellation/noiseSuppression must be false for
-      // system audio (they are designed for mic input, not loopback).
-
-      // _screenStream = await navigator.mediaDevices.getDisplayMedia({
-      //   'video': {
-      //     'width': {'max': 1920},
-      //     'height': {'max': 1080},
-      //     'frameRate': {'max': 15},
-      //   },
-
       _screenStream = await navigator.mediaDevices.getDisplayMedia({
         'video': {
-          'width': {'ideal': 1280, 'max': 1280}, // drop from 1920
-          'height': {'ideal': 720, 'max': 720}, // drop from 1080
-          'frameRate': {'ideal': 30, 'max': 30}, // bump from 15
+          'width': {'ideal': 1280, 'max': 1280},
+          'height': {'ideal': 720, 'max': 720},
+          'frameRate': {'ideal': 30, 'max': 30},
         },
         'audio': {
           'suppressLocalAudioPlayback': false,
@@ -285,17 +272,36 @@ class WebRTCService {
 
       final screenVideoTrack = _screenStream!.getVideoTracks().first;
 
-      // BUG 2 FIX: always add screen share as a NEW sender — never reuse the
-      // camera sender via replaceTrack(). When replaceTrack is used the viewer
-      // receives the same stream ID as the camera stream, so the dedup guard
-      // in CallScreen routes it to _pipRenderer instead of _mainRenderer.
-      // A new addTrack() call gives a new stream ID, which combined with the
-      // screen_start signal correctly routes to _mainRenderer.
+      // ✅ MOBILE WEB FIX: getDisplayMedia on iOS/Android silently returns
+      // a camera track instead of a screen track. Detect this by checking
+      // the track's label — camera tracks contain "camera" or "facetime"
+      // or have facingMode, screen tracks contain "screen" or "window" or "tab".
+      // If it looks like a camera, abort immediately.
+      final label = (screenVideoTrack.label ?? '').toLowerCase();
+      final looksLikeScreen = label.contains('screen') ||
+          label.contains('window') ||
+          label.contains('tab') ||
+          label.contains('display') ||
+          label.contains('monitor');
+      final looksLikeCamera = label.contains('camera') ||
+          label.contains('facetime') ||
+          label.contains('front') ||
+          label.contains('back') ||
+          label.contains('webcam');
+
+      if (kIsWeb && looksLikeCamera && !looksLikeScreen) {
+        // Mobile browser gave us camera instead of screen — abort
+        _screenStream!.getTracks().forEach((t) => t.stop());
+        _screenStream!.dispose();
+        _screenStream = null;
+        debugPrint('❌ Screen share aborted: got camera track on mobile web');
+        return false; // ← caller shows error to user
+      }
+
       _screenVideoSender =
           await _peerConnection!.addTrack(screenVideoTrack, _screenStream!);
-      debugPrint('🖥️ Screen video sender stored');
+      debugPrint('🖥️ Screen video sender stored (label: $label)');
 
-      // Store screen audio sender reference for precise removal on stop.
       final screenAudioTracks = _screenStream!.getAudioTracks();
       if (screenAudioTracks.isNotEmpty) {
         _screenAudioSender = await _peerConnection!
@@ -309,16 +315,17 @@ class WebRTCService {
       _screenSharing = true;
       onNegotiationNeeded?.call();
 
-      // BUG 1 FIX (screen): also handle track-end for screen share so the
-      // sharer's UI updates and screen_off is sent if user stops via browser UI.
       screenVideoTrack.onEnded = () {
         _screenSharing = false;
         _clearScreenTrack();
         onScreenShareStopped?.call();
       };
+
+      return true;
     } catch (e) {
       debugPrint('❌ Screen share error: $e');
       _screenSharing = false;
+      return false;
     }
   }
 
