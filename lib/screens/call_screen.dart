@@ -353,7 +353,6 @@ class _CallScreenState extends State<CallScreen> {
       await _webrtc.stopScreenShare();
       setState(() => _screenSharing = false);
     } else {
-      // Resume AudioContext on user gesture — satisfies browser autoplay policy
       if (kIsWeb) WebAudioPlayer.resume();
 
       _signaling.sendScreenStart();
@@ -364,6 +363,9 @@ class _CallScreenState extends State<CallScreen> {
           if (mounted) _showMobileScreenShareUnsupported();
           return;
         }
+        // Force renegotiation after adding screen track
+        final offer = await _webrtc.createOffer();
+        _signaling.sendOffer(offer.sdp!);
         setState(() => _screenSharing = _webrtc.screenSharing);
       } catch (e, stack) {
         debugPrint('💥 _toggleScreenShare crash: $e\n$stack');
