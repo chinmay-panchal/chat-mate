@@ -52,7 +52,11 @@ class WebAudioPlayer {
       if (buffer == null) return;
       final audioBuffer = buffer as js.JsObject;
 
-      final data = pcmBytes.buffer.asInt16List();
+      final byteData = ByteData.sublistView(pcmBytes);
+      final data = Int16List(pcmBytes.length ~/ 2);
+      for (int i = 0; i < data.length; i++) {
+        data[i] = byteData.getInt16(i * 2, Endian.little);
+      }
 
       for (int ch = 0; ch < channels; ch++) {
         final float32Ctor = js.context['Float32Array'];
