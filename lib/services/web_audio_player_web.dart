@@ -29,15 +29,19 @@ class WebAudioPlayer {
     } catch (_) {}
   }
 
-  static void play(
-    Uint8List pcmBytes, {
-    int sampleRate = 48000,
-    int channels = 2,
-  }) {
+  static void play(Uint8List pcmBytes,
+      {int sampleRate = 48000, int channels = 2}) {
     _ensureCtx();
     final ctx = _ctx;
     if (ctx == null) return;
 
+    // ADD THIS:
+    final state = ctx['state'];
+    debugPrint('🔊 WebAudioPlayer.play: state=$state bytes=${pcmBytes.length}');
+    if (state != 'running') {
+      ctx.callMethod('resume', []);
+      return; // drop this packet, next one will play after resume
+    }
     try {
       final totalSamples = pcmBytes.length ~/ 2;
       final frames = totalSamples ~/ channels;
