@@ -83,8 +83,11 @@ class WebRTCService {
     'optional': [],
   };
 
+  bool _isInitiator = false;
+
   // ── Initialize ────────────────────────────────────────────────────────────
   Future<void> initialize({bool isInitiator = false}) async {
+    _isInitiator = isInitiator;
     _peerConnection = await createPeerConnection(_iceConfig);
 
     _peerConnection!.onIceCandidate = (candidate) {
@@ -104,11 +107,9 @@ class WebRTCService {
 
     _peerConnection!.onRenegotiationNeeded = () {
       debugPrint('🔄 Native renegotiation needed');
-      onNegotiationNeeded?.call();
+      if (_isInitiator) onNegotiationNeeded?.call();
     };
 
-    // Viewer side: receive system-audio PCM via DataChannel.
-    // CallScreen.onRemoteAudioData decides how to play it (web vs Android).
     _peerConnection!.onDataChannel = (RTCDataChannel channel) {
       if (channel.label == 'system_audio') {
         debugPrint('🎵 Received system_audio DataChannel from sharer');
@@ -121,14 +122,16 @@ class WebRTCService {
       }
     };
 
-    // Sharer side: create DataChannel upfront so it appears in the SDP offer.
     if (isInitiator) {
       _audioDataChannel = await _peerConnection!.createDataChannel(
         'system_audio',
         RTCDataChannelInit()
           ..ordered = false
-          ..maxRetransmits = 0, // UDP-like — drop stale audio frames
+          ..maxRetransmits = 0,
       );
+      _audioDataChannel!.onDataChannelState = (state) {
+        debugPrint('🎵 DataChannel state: $state');
+      };
       debugPrint('🎵 system_audio DataChannel created (Initiator)');
     }
 
