@@ -15,6 +15,10 @@ dependencies:
   cupertino_icons: ^1.0.8
   google_fonts: ^8.0.2
 
+dependency_overrides:        # ← must be its own top-level key
+  flutter_webrtc:
+    path: ./flutter_webrtc_local
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

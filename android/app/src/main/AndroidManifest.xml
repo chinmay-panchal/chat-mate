@@ -38,11 +38,21 @@
             </intent-filter>
         </activity>
 
-        <!-- Screen capture service for flutter_webrtc -->
-        <service
-            android:name="com.cloudwebrtc.webrtc.screen.ScreenCapturerService"
-            android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+        <!--
+            flutter_webrtc's ScreenCapturerService handles the foreground service
+            of type mediaProjection that Android 14+ requires BEFORE getDisplayMedia().
+            This is the ONLY mediaProjection service needed — do NOT add your own.
+        -->
+<service
+    android:name="com.cloudwebrtc.webrtc.ScreenCapturerService"
+    android:exported="false"
+    android:foregroundServiceType="mediaProjection" />
+
+    <service
+    android:name=".ScreenShareForegroundService"
+    android:exported="false"
+    android:foregroundServiceType="mediaProjection" />
+
 
         <meta-data
             android:name="flutterEmbedding"

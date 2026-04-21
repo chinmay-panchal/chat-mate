@@ -4,8 +4,9 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../services/webrtc_service.dart';
 import '../services/signaling_service.dart';
-import 'package:flutter/foundation.dart'; // for kIsWeb
-import 'dart:html' as html; // for html.window
+import '../services/web_audio_player.dart'
+    if (dart.library.js) '../services/web_audio_player_web.dart';
+import 'package:flutter/foundation.dart';
 
 class CallScreen extends StatefulWidget {
   final String roomId;
@@ -24,18 +25,15 @@ class CallScreen extends StatefulWidget {
 }
 
 class _CallScreenState extends State<CallScreen> {
-  // ── Renderers ─────────────────────────────────────────────────────────────
-  //
-  // _mainRenderer  → screen share video (viewer only, full screen)
-  // _pipRenderer   → remote camera (small corner overlay)
-  // _audioRenderer → HIDDEN 0×0 renderer required by Flutter Web to play
-  //                  remote audio. On mobile audio auto-plays; this is a no-op.
   final _mainRenderer = RTCVideoRenderer();
   final _pipRenderer = RTCVideoRenderer();
   final _audioRenderer = RTCVideoRenderer();
 
   late WebRTCService _webrtc;
   late SignalingService _signaling;
+
+  static const _audioPlaybackChannel =
+      MethodChannel('com.example.chat_mate/screen_share');
 
   bool _micOn = true;
   bool _cameraOn = false;
@@ -46,37 +44,29 @@ class _CallScreenState extends State<CallScreen> {
 
   bool _remoteScreenActive = false;
   bool _remoteCameraActive = false;
-
-  // Set to true ONLY when a screen_start signal arrives from the sharer.
-  // The next incoming VIDEO track is then routed to _mainRenderer.
-  // Without this guard a camera stream could fill the main view.
   bool _expectingScreenStream = false;
-
-  // Stream IDs already routed — prevents duplicate onTrack fires from
-  // renegotiation from re-routing to the wrong renderer.
   String? _screenStreamId;
   String? _cameraStreamId;
-
-  // ── Audio stream ID guards ────────────────────────────────────────────────
-  // BUG 3/4 FIX: track mic and screen audio stream IDs separately.
-  //
-  // _audioStreamId      → the mic audio stream currently in _audioRenderer.
-  //                        Never cleared on screen_off — mic audio is continuous.
-  // _screenAudioStreamId → the screen share audio stream ID.
-  //                        Cleared on screen_off; _audioRenderer keeps the mic
-  //                        stream so audio doesn't cut out after screen share ends.
-  //
-  // Old code used a single _audioStreamId and cleared both on screen_off,
-  // which left _audioRenderer with no stream after screen share ended —
-  // causing mic audio to silently drop for the rest of the call.
   String? _audioStreamId;
-  String? _screenAudioStreamId; // BUG 4 FIX: separate guard for screen audio
+  String? _screenAudioStreamId;
 
   @override
   void initState() {
     super.initState();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    // Initialise Web Audio API as early as possible (before user gesture
+    // restriction kicks in on some browsers).
+    if (kIsWeb) WebAudioPlayer.init();
     _init();
+  }
+
+  void _setupAudioCaptureHandler() {
+    _audioPlaybackChannel.setMethodCallHandler((call) async {
+      if (call.method == 'onAudioCaptured') {
+        final bytes = call.arguments as Uint8List;
+        _webrtc.relayAudioToViewer(bytes);
+      }
+    });
   }
 
   void _setConnected(bool value, String source) {
@@ -91,36 +81,18 @@ class _CallScreenState extends State<CallScreen> {
 
     _webrtc = WebRTCService();
 
+    _setupAudioCaptureHandler();
+
     _webrtc.onNegotiationNeeded = () async {
       debugPrint('🔄 Renegotiating...');
       final offer = await _webrtc.createOffer();
       _signaling.sendOffer(offer.sdp!);
     };
 
-    // ── Remote stream routing ─────────────────────────────────────────────
-    //
-    // trackKind == 'audio':
-    //   BUG 3/4 FIX: split into mic vs screen audio using _expectingScreenStream.
-    //   - If _expectingScreenStream is true when audio arrives → screen audio.
-    //     Tag with _screenAudioStreamId. _audioRenderer gets the screen audio.
-    //   - Otherwise → mic audio. Tag with _audioStreamId.
-    //   Both still go to _audioRenderer (one renderer plays whatever is newest).
-    //   On screen_off we only clear _screenAudioStreamId; the mic stream stays
-    //   active in the renderer so voice continues without interruption.
-    //
-    // trackKind == 'video', isInitiator:
-    //   Always → _pipRenderer (viewer's camera).
-    //
-    // trackKind == 'video', viewer, _expectingScreenStream == true:
-    //   → _mainRenderer (screen share). Flag cleared immediately.
-    //
-    // trackKind == 'video', viewer, _expectingScreenStream == false:
-    //   → _pipRenderer (sharer's camera).
     _webrtc.onRemoteStream = (stream, trackKind) {
       if (!mounted) return;
       final id = stream.id;
 
-      // ── Audio ────────────────────────────────────────────────────────────
       if (trackKind == 'audio') {
         if (_expectingScreenStream) {
           if (_screenAudioStreamId == id) return;
@@ -128,10 +100,6 @@ class _CallScreenState extends State<CallScreen> {
           setState(() => _audioRenderer.srcObject = stream);
           debugPrint('🔊 Screen audio → hidden renderer ($id)');
         } else {
-          // ✅ REMOVE the _audioStreamId == id early-return guard
-          // Renegotiation re-fires onTrack for mic with same stream ID,
-          // but _audioRenderer.srcObject may have been overwritten by
-          // screen audio in the meantime — always re-attach mic audio.
           _audioStreamId = id;
           setState(() => _audioRenderer.srcObject = stream);
           debugPrint('🔊 Mic audio → hidden renderer ($id)');
@@ -139,11 +107,8 @@ class _CallScreenState extends State<CallScreen> {
         return;
       }
 
-      // ── Video ─────────────────────────────────────────────────────────────
       if (trackKind != 'video') return;
 
-      // ── Initiator (sharer) ────────────────────────────────────────────────
-      // Only ever receives the viewer's camera → always PiP.
       if (widget.isInitiator) {
         if (_cameraStreamId == id) return;
         _cameraStreamId = id;
@@ -155,15 +120,9 @@ class _CallScreenState extends State<CallScreen> {
         return;
       }
 
-      // ── Viewer ────────────────────────────────────────────────────────────
-      // Deduplicate: skip if this stream ID is already routed anywhere.
-      if (_screenStreamId == id || _cameraStreamId == id) {
-        debugPrint('📺 Video stream already routed, skipping ($id)');
-        return;
-      }
+      if (_screenStreamId == id || _cameraStreamId == id) return;
 
       if (_expectingScreenStream) {
-        // screen_start signal arrived before this track → it's the screen share.
         _expectingScreenStream = false;
         _screenStreamId = id;
         setState(() {
@@ -173,7 +132,6 @@ class _CallScreenState extends State<CallScreen> {
         _setConnected(true, 'screen_stream_received');
         debugPrint('🖥️ [Viewer] Screen share → main ($id)');
       } else {
-        // No screen_start received → this is the sharer's camera → PiP only.
         _cameraStreamId = id;
         setState(() {
           _pipRenderer.srcObject = stream;
@@ -183,13 +141,29 @@ class _CallScreenState extends State<CallScreen> {
       }
     };
 
-    // Local camera off → tell peer to clear PiP.
     _webrtc.onCameraOff = () => _signaling.sendCameraOff();
 
-    // Local screen share stopped → tell viewer to clear main view.
     _webrtc.onScreenShareStopped = () {
       if (mounted) setState(() => _screenSharing = false);
       _signaling.sendScreenOff();
+    };
+
+    // System-audio PCM arrives here from the sharer's DataChannel.
+    // Route to the correct player depending on platform:
+    //   Web viewer  → WebAudioPlayer (Web Audio API, no native code needed)
+    //   Android viewer → native AudioTrack via MethodChannel
+    //   Initiator (sharer) → ignore (this is our own echo, should not arrive
+    //                         but guard anyway)
+    _webrtc.onRemoteAudioData = (Uint8List data) async {
+      if (widget.isInitiator) return; // sharer never plays back own audio
+      if (kIsWeb) {
+        // Resume AudioContext on first data packet — covers browsers that
+        // require a user gesture before allowing audio output.
+        WebAudioPlayer.resume();
+        WebAudioPlayer.play(data);
+      } else {
+        await _webrtc.sendAudioBytesToNative(data);
+      }
     };
 
     _webrtc.onConnectionState = (state) {
@@ -210,11 +184,10 @@ class _CallScreenState extends State<CallScreen> {
       });
     };
 
-    // Fully initialise WebRTC before wiring signaling to avoid the race
-    // where an offer arrives before the local audio track is ready.
-    await _webrtc.initialize();
+    await _webrtc.initialize(isInitiator: widget.isInitiator);
 
     _signaling = widget.signalingService;
+
     _signaling.onPeerJoined = () {
       debugPrint('👤 SIGNAL: Peer joined');
       if (!mounted) return;
@@ -222,22 +195,19 @@ class _CallScreenState extends State<CallScreen> {
       _setConnected(true, 'onPeerJoined');
       if (widget.isInitiator) _createOffer();
     };
+
     _signaling.onPeerLeft = () => _handleDisconnect();
+
     _signaling.onError = (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('Signal error: $e')));
       }
     };
-    // Set onMessage last — flushes any queued messages immediately.
+
     _signaling.onMessage = _handleSignalingMessage;
 
     if (mounted) setState(() => _initialized = true);
-
-    if (widget.isInitiator) {
-      debugPrint('📤 Initiator creating offer...');
-      _createOffer();
-    }
   }
 
   Future<void> _createOffer() async {
@@ -251,12 +221,10 @@ class _CallScreenState extends State<CallScreen> {
 
     switch (type) {
       case 'peer_joined':
-        debugPrint('👤 CallScreen received peer_joined');
         _setConnected(true, 'peer_joined_message');
         break;
 
       case 'joined':
-        debugPrint('👤 Viewer joined room');
         _setConnected(true, 'viewer_joined');
         break;
 
@@ -270,10 +238,16 @@ class _CallScreenState extends State<CallScreen> {
         break;
 
       case 'answer':
-        await _webrtc.setRemoteDescription(
-          RTCSessionDescription(msg['sdp'] as String, 'answer'),
-        );
-        if (mounted) _setConnected(true, 'answer_received');
+        final signalingState = await _webrtc.getSignalingState();
+        if (signalingState ==
+            RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+          await _webrtc.setRemoteDescription(
+            RTCSessionDescription(msg['sdp'] as String, 'answer'),
+          );
+          if (mounted) _setConnected(true, 'answer_received');
+        } else {
+          debugPrint('⚠️ Ignoring answer in wrong state: $signalingState');
+        }
         break;
 
       case 'candidate':
@@ -285,18 +259,21 @@ class _CallScreenState extends State<CallScreen> {
         ));
         break;
 
-      // Sharer is about to start a screen share stream.
-      // Set the flag BEFORE the renegotiation offer arrives so the next
-      // incoming video track is correctly routed to _mainRenderer.
       case 'screen_start':
-        debugPrint('🖥️ screen_start received — expecting screen stream');
+        debugPrint('🖥️ screen_start — expecting screen stream');
         if (mounted) setState(() => _expectingScreenStream = true);
+        // Only Android viewer needs to pre-start the native AudioTrack.
+        // Web viewer plays via WebAudioPlayer on demand (no pre-start needed).
+        if (!widget.isInitiator && !kIsWeb) {
+          try {
+            await _audioPlaybackChannel.invokeMethod('startAudioPlayback');
+            debugPrint('🔊 Viewer AudioTrack started');
+          } catch (e) {
+            debugPrint('⚠️ startAudioPlayback error: $e');
+          }
+        }
         break;
 
-      // BUG 1 FIX: Peer turned off camera → clear PiP and reset stream ID.
-      // This now also handles the case where the sharer's OS/browser forcibly
-      // ended the camera track (onEnded fires in WebRTCService → onCameraOff
-      // callback → signaling.sendCameraOff() → arrives here).
       case 'camera_off':
         if (mounted) {
           setState(() {
@@ -307,28 +284,25 @@ class _CallScreenState extends State<CallScreen> {
         }
         break;
 
-      // Sharer stopped screen share → clear main view on viewer.
-      // BUG 4 FIX: do NOT clear _audioStreamId or null _audioRenderer.srcObject.
-      // The mic audio sender is still active — clearing the renderer here was
-      // causing mic audio to go silent for the rest of the call after screen
-      // share ended. Only reset the screen audio tracking variables.
       case 'screen_off':
         if (mounted && !widget.isInitiator) {
           setState(() {
             _mainRenderer.srcObject = null;
             _remoteScreenActive = false;
             _expectingScreenStream = false;
-            // Re-attach mic audio since screen audio may have overwritten it
-            if (_audioStreamId != null) {
-              // _audioRenderer will be re-set by the next onTrack re-fire
-              // from renegotiation — just null the screen audio guard
-            }
           });
           _screenStreamId = null;
           _screenAudioStreamId = null;
-          // _audioStreamId intentionally kept — forces re-route on next onTrack
-          _audioStreamId =
-              null; // ✅ clear so the dedup guard doesn't block re-attach
+          _audioStreamId = null;
+          // Stop native AudioTrack on Android; web just stops receiving data.
+          if (!kIsWeb) {
+            try {
+              await _audioPlaybackChannel.invokeMethod('stopAudioPlayback');
+              debugPrint('🔇 Viewer AudioTrack stopped');
+            } catch (e) {
+              debugPrint('⚠️ stopAudioPlayback error: $e');
+            }
+          }
         }
         break;
     }
@@ -373,32 +347,28 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   Future<void> _toggleScreenShare() async {
-    if (kIsWeb) {
-      // ignore: avoid_web_libraries_in_flutter
-      final userAgent = html.window.navigator.userAgent.toLowerCase();
-      final isMobile = userAgent.contains('iphone') ||
-          userAgent.contains('ipad') ||
-          userAgent.contains('android');
-      if (isMobile) {
-        _showMobileScreenShareUnsupported();
-        return;
-      }
-    }
+    debugPrint('🚀 _toggleScreenShare clicked');
 
     if (_screenSharing) {
       await _webrtc.stopScreenShare();
       setState(() => _screenSharing = false);
     } else {
+      // Resume AudioContext on user gesture — satisfies browser autoplay policy
+      if (kIsWeb) WebAudioPlayer.resume();
+
       _signaling.sendScreenStart();
-      final success = await _webrtc.startScreenShare();
-
-      if (!success) {
+      try {
+        final success = await _webrtc.startScreenShare();
+        if (!success) {
+          _signaling.sendScreenOff();
+          if (mounted) _showMobileScreenShareUnsupported();
+          return;
+        }
+        setState(() => _screenSharing = _webrtc.screenSharing);
+      } catch (e, stack) {
+        debugPrint('💥 _toggleScreenShare crash: $e\n$stack');
         _signaling.sendScreenOff();
-        if (mounted) _showMobileScreenShareUnsupported();
-        return;
       }
-
-      setState(() => _screenSharing = _webrtc.screenSharing);
     }
   }
 
@@ -414,7 +384,6 @@ class _CallScreenState extends State<CallScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // Drag handle
             Container(
               width: 40,
               height: 4,
@@ -424,7 +393,6 @@ class _CallScreenState extends State<CallScreen> {
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
-            // Icon
             Container(
               width: 64,
               height: 64,
@@ -453,7 +421,7 @@ class _CallScreenState extends State<CallScreen> {
             ),
             const SizedBox(height: 10),
             Text(
-              'Mobile browsers don\'t support screen sharing.\nOpen this app on a desktop browser to share your screen.',
+              'Screen sharing is not supported here.\nTry opening the app on a desktop browser.',
               textAlign: TextAlign.center,
               style: GoogleFonts.spaceGrotesk(
                 fontSize: 13,
@@ -521,6 +489,7 @@ class _CallScreenState extends State<CallScreen> {
   @override
   void dispose() {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    if (kIsWeb) WebAudioPlayer.dispose();
     _mainRenderer.dispose();
     _pipRenderer.dispose();
     _audioRenderer.dispose();
@@ -542,9 +511,6 @@ class _CallScreenState extends State<CallScreen> {
       body: Stack(
         children: [
           Positioned.fill(child: _buildMainContent()),
-
-          // Hidden 0×0 audio renderer — required by Flutter Web to play
-          // remote audio streams. Invisible to the user; harmless on mobile.
           Positioned(
             width: 0,
             height: 0,
@@ -553,8 +519,6 @@ class _CallScreenState extends State<CallScreen> {
               objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
             ),
           ),
-
-          // PiP: remote camera in a small fixed corner box.
           if (_remoteCameraActive)
             Positioned(
               bottom: 110,
@@ -565,8 +529,6 @@ class _CallScreenState extends State<CallScreen> {
                 height: pipH,
               ),
             ),
-
-          // Top bar
           Positioned(
             top: 0,
             left: 0,
@@ -594,8 +556,6 @@ class _CallScreenState extends State<CallScreen> {
               ),
             ),
           ),
-
-          // Bottom controls
           Positioned(
             bottom: 0,
             left: 0,
@@ -643,7 +603,6 @@ class _CallScreenState extends State<CallScreen> {
       );
     }
 
-    // Initiator (sharer)
     if (_screenSharing) {
       return _SharingView(
           isBeingWatched: _isBeingWatched, roomId: widget.roomId);
