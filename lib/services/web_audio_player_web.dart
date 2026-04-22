@@ -94,10 +94,9 @@ class WebAudioPlayer {
         final channelData = audioBuffer.callMethod('getChannelData', [ch]);
         if (channelData == null) return;
 
-        final jsArray = channelData as js.JsObject;
-
+        final floatData = channelData as Float32List;
         for (int i = 0; i < frames; i++) {
-          jsArray[i] = data[i * channels + ch] / 32768.0;
+          floatData[i] = data[i * channels + ch] / 32768.0;
         }
       }
 

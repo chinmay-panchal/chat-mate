@@ -84,17 +84,8 @@ class ScreenShareForegroundService : Service() {
             }
 
             ACTION_START_AUDIO -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val projection = pendingMediaProjection
-                    pendingMediaProjection = null
-                    if (projection != null) {
-                        startInternalAudioCapture(projection)
-                    } else {
-                        Log.e(TAG, "❌ No MediaProjection for audio capture")
-                    }
-                } else {
-                    Log.w(TAG, "⚠️ Internal audio capture requires Android 10+")
-                }
+                // No MediaProjection needed for mic-based capture
+                startInternalAudioCapture()
             }
 
             ACTION_STOP_AUDIO -> stopInternalAudioCapture()
@@ -108,8 +99,8 @@ class ScreenShareForegroundService : Service() {
         return START_NOT_STICKY
     }
 
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun startInternalAudioCapture(projection: MediaProjection) {
+    // Removed @RequiresApi — mic capture works on all API levels
+    private fun startInternalAudioCapture() {
         if (isCapturing) {
             Log.w(TAG, "⚠️ Already capturing audio")
             return
@@ -123,23 +114,19 @@ class ScreenShareForegroundService : Service() {
         val bufferSize = minBufferSize * 2
 
         try {
-            val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
-                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                .build()
+            val source = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                android.media.MediaRecorder.AudioSource.UNPROCESSED
+            } else {
+                android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION
+            }
 
-            audioRecord = AudioRecord.Builder()
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AUDIO_FORMAT)
-                        .setSampleRate(SAMPLE_RATE)
-                        .setChannelMask(CHANNEL_CONFIG)
-                        .build()
-                )
-                .setBufferSizeInBytes(bufferSize)
-                .setAudioPlaybackCaptureConfig(captureConfig)
-                .build()
+            audioRecord = AudioRecord(
+                source,
+                SAMPLE_RATE,
+                CHANNEL_CONFIG,
+                AUDIO_FORMAT,
+                bufferSize
+            )
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                 Log.e(TAG, "❌ AudioRecord failed to initialize")
@@ -150,23 +137,19 @@ class ScreenShareForegroundService : Service() {
 
             isCapturing = true
             audioRecord?.startRecording()
-            Log.d(TAG, "🎵 Internal audio capture started")
+            Log.d(TAG, "🎵 Mic audio capture started")
 
             audioCapturingThread = Thread {
                 val buffer = ShortArray(bufferSize / 2)
                 while (isCapturing) {
                     val read = audioRecord?.read(buffer, 0, buffer.size) ?: -1
                     if (read > 0) {
-                        val nonZero = buffer.take(read).any { it != 0.toShort() }
-                        Log.d(TAG, "🎵 read=$read nonZero=$nonZero")
                         val bytes = ByteArray(read * 2)
                         for (i in 0 until read) {
                             bytes[i * 2] = (buffer[i].toInt() and 0xFF).toByte()
                             bytes[i * 2 + 1] = (buffer[i].toInt() shr 8 and 0xFF).toByte()
                         }
-                        // Send to DataChannel relay (sharer → viewer)
                         audioDataChannelCallback?.invoke(bytes)
-                        // Keep EventChannel sink for any legacy listeners
                         Handler(Looper.getMainLooper()).post {
                             audioEventSink?.success(bytes)
                         }
