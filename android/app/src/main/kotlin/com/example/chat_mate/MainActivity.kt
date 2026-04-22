@@ -157,34 +157,16 @@ class MainActivity : FlutterFragmentActivity() {
                     result.success(null)
                 }
 
-"startInternalAudioCapture" -> {
-    try {
-        var projection: android.media.projection.MediaProjection? = null
-
-runCatching {
-    val capturerClass = Class.forName("com.cloudwebrtc.webrtc.OrientationAwareScreenCapturer")
-    val mp = capturerClass.getField("lastCreatedProjection").get(null)
-        as? android.media.projection.MediaProjection
-    if (mp != null) {
-        Log.d(TAG, "✅ Got MediaProjection from static lastCreatedProjection")
-        projection = mp
-    }
-}.onFailure { e ->
-    Log.e(TAG, "❌ Static field access failed: ${e.message}", e)
-}
-
-        if (projection != null) {
-            ScreenShareForegroundService.pendingMediaProjection = projection
-            startService(Intent(this, ScreenShareForegroundService::class.java)
-                .setAction(ScreenShareForegroundService.ACTION_START_AUDIO))
-            result.success(null)
-        } else {
-            result.error("NO_MEDIA_PROJECTION", "Could not obtain MediaProjection", null)
-        }
-    } catch (e: Exception) {
-        result.error("AUDIO_CAPTURE_ERROR", e.message, null)
-    }
-}
+                "startInternalAudioCapture" -> {
+                    try {
+                        // No MediaProjection needed — mic capture works directly
+                        startService(Intent(this, ScreenShareForegroundService::class.java)
+                            .setAction(ScreenShareForegroundService.ACTION_START_AUDIO))
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("AUDIO_CAPTURE_ERROR", e.message, null)
+                    }
+                }
 
                 "stopInternalAudioCapture" -> {
                     try {
