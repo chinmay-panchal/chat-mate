@@ -8,7 +8,6 @@ class WebAudioPlayer {
   static js.JsObject? _ctx;
   static double _nextPlayTime = 0.0;
 
-  /// 🔊 Unified logger (Flutter + Chrome DevTools)
   static void _log(String msg) {
     debugPrint(msg);
     try {
@@ -25,10 +24,8 @@ class WebAudioPlayer {
         _log('❌ AudioContext not supported');
         return;
       }
-
       _ctx = js.JsObject(ctor as js.JsFunction, []);
       _nextPlayTime = 0.0;
-
       _log('🔊 AudioContext created');
     } catch (e) {
       _log('⚠️ init failed: $e');
@@ -39,7 +36,6 @@ class WebAudioPlayer {
     if (_ctx == null) return;
     try {
       _ctx!.callMethod('resume', []);
-      _log('▶️ AudioContext resumed');
     } catch (e) {
       _log('⚠️ resume failed: $e');
     }
@@ -53,72 +49,47 @@ class WebAudioPlayer {
 
     try {
       final state = ctx['state'];
-      _log('🔊 play() state=$state bytes=${pcmBytes.length}');
-
-      // ✅ DO NOT drop packet
       if (state != 'running') {
         ctx.callMethod('resume', []);
       }
 
       final totalSamples = pcmBytes.length ~/ 2;
       final frames = totalSamples ~/ channels;
+      if (frames <= 0) return;
 
-      if (frames <= 0) {
-        _log('⚠️ No frames');
-        return;
-      }
-
-      final buffer =
-          ctx.callMethod('createBuffer', [channels, frames, sampleRate]);
-      if (buffer == null) return;
-
-      final audioBuffer = buffer as js.JsObject;
-
+      // Decode PCM16LE → Float32, deinterleaved per channel
       final byteData = ByteData.sublistView(pcmBytes);
-      final data = Int16List(totalSamples);
+      final float32PerChannel =
+          List.generate(channels, (_) => Float32List(frames));
 
-      for (int i = 0; i < totalSamples; i++) {
-        data[i] = byteData.getInt16(i * 2, Endian.little);
-      }
-
-      // 🔍 DEBUG: check audio presence
-      int nonZero = 0;
-      for (int i = 0; i < data.length && i < 200; i++) {
-        if (data[i] != 0) nonZero++;
-      }
-      _log('📊 samples=${data.length}, nonZero=$nonZero');
-      _log('🎵 first10=${data.take(10).toList()}');
-
-      // ✅ FIXED: direct write (NO Float32Array, NO set())
-      for (int ch = 0; ch < channels; ch++) {
-        final channelData = audioBuffer.callMethod('getChannelData', [ch]);
-        if (channelData == null) return;
-
-        final jsArray = channelData as js.JsObject;
-
-        for (int i = 0; i < frames; i++) {
-          jsArray[i] = data[i * channels + ch] / 32768.0;
+      for (int i = 0; i < frames; i++) {
+        for (int ch = 0; ch < channels; ch++) {
+          final raw = byteData.getInt16((i * channels + ch) * 2, Endian.little);
+          float32PerChannel[ch][i] = raw / 32768.0;
         }
       }
 
-      final currentTimeRaw = ctx['currentTime'];
-      final currentTime =
-          currentTimeRaw != null ? (currentTimeRaw as num).toDouble() : 0.0;
+      final audioBuffer =
+          ctx.callMethod('createBuffer', [channels, frames, sampleRate])
+              as js.JsObject;
 
-      _log('⏱ currentTime=$currentTime next=$_nextPlayTime frames=$frames');
-
-      if (_nextPlayTime < currentTime) {
-        _nextPlayTime = currentTime;
+      for (int ch = 0; ch < channels; ch++) {
+        // getChannelData() returns a JS Float32Array.
+        // Convert Dart Float32List → JS Array, then call .set() on the
+        // Float32Array to bulk-copy — avoids the index-assign type error.
+        final jsChannelData =
+            audioBuffer.callMethod('getChannelData', [ch]) as js.JsObject;
+        final jsArray = js.JsArray.from(float32PerChannel[ch]);
+        jsChannelData.callMethod('set', [jsArray]);
       }
 
-      final source = ctx.callMethod('createBufferSource', []);
-      if (source == null) return;
+      final currentTime = (ctx['currentTime'] as num?)?.toDouble() ?? 0.0;
+      if (_nextPlayTime < currentTime) _nextPlayTime = currentTime;
 
-      final sourceNode = source as js.JsObject;
-
-      sourceNode['buffer'] = audioBuffer;
-      sourceNode.callMethod('connect', [ctx['destination']]);
-      sourceNode.callMethod('start', [_nextPlayTime]);
+      final source = ctx.callMethod('createBufferSource', []) as js.JsObject;
+      source['buffer'] = audioBuffer;
+      source.callMethod('connect', [ctx['destination']]);
+      source.callMethod('start', [_nextPlayTime]);
 
       _nextPlayTime += frames / sampleRate;
     } catch (e) {

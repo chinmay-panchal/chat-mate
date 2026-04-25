@@ -25,6 +25,7 @@ class RTCPeerConnectionNative extends RTCPeerConnection {
 
   // private:
   final String _peerConnectionId;
+  String get peerConnectionId => _peerConnectionId;
   StreamSubscription<dynamic>? _eventSubscription;
   final _localStreams = <MediaStream>[];
   final _remoteStreams = <MediaStream>[];

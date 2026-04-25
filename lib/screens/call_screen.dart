@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:video_player/video_player.dart';
 import '../services/webrtc_service.dart';
 import '../services/signaling_service.dart';
 import '../services/web_audio_player.dart'
@@ -37,7 +38,8 @@ class _CallScreenState extends State<CallScreen> {
 
   bool _micOn = true;
   bool _cameraOn = false;
-  bool _screenSharing = false;
+  bool _screenSharing = false; // web only
+  bool _videoSharing = false; // mobile only
   bool _connected = false;
   bool _initialized = false;
   bool _isBeingWatched = false;
@@ -50,27 +52,31 @@ class _CallScreenState extends State<CallScreen> {
   String? _audioStreamId;
   String? _screenAudioStreamId;
 
+  // ── Init ──────────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    // Initialise Web Audio API as early as possible (before user gesture
-    // restriction kicks in on some browsers).
     if (kIsWeb) WebAudioPlayer.init();
     _init();
   }
 
   void _setupAudioCaptureHandler() {
     _audioPlaybackChannel.setMethodCallHandler((call) async {
-      if (call.method == 'onAudioCaptured') {
-        final bytes = call.arguments as Uint8List;
-        _webrtc.relayAudioToViewer(bytes);
+      switch (call.method) {
+        case 'onAudioCaptured':
+          // Existing: screen share audio from native FGS
+          final bytes = call.arguments as Uint8List;
+          _webrtc.relayAudioToViewer(bytes);
+          break;
+        // onVideoShareAudioPCM is handled inside VideoShareService itself —
+        // no action needed here.
       }
     });
   }
 
   void _setConnected(bool value, String source) {
-    debugPrint('🟢 CONNECTED CHANGE -> $value (from $source)');
+    debugPrint('🟢 CONNECTED -> $value ($source)');
     if (mounted) setState(() => _connected = value);
   }
 
@@ -80,7 +86,6 @@ class _CallScreenState extends State<CallScreen> {
     await _audioRenderer.initialize();
 
     _webrtc = WebRTCService();
-
     _setupAudioCaptureHandler();
 
     _webrtc.onNegotiationNeeded = () async {
@@ -102,13 +107,14 @@ class _CallScreenState extends State<CallScreen> {
         } else {
           _audioStreamId = id;
           setState(() => _audioRenderer.srcObject = stream);
-          debugPrint('🔊 Mic audio → hidden renderer ($id)');
+          debugPrint('🔊 Mic/video audio → hidden renderer ($id)');
         }
         return;
       }
 
       if (trackKind != 'video') return;
 
+      // Initiator sees remote camera in PiP
       if (widget.isInitiator) {
         if (_cameraStreamId == id) return;
         _cameraStreamId = id;
@@ -130,7 +136,7 @@ class _CallScreenState extends State<CallScreen> {
           _remoteScreenActive = true;
         });
         _setConnected(true, 'screen_stream_received');
-        debugPrint('🖥️ [Viewer] Screen share → main ($id)');
+        debugPrint('🖥️ [Viewer] Screen/video → main ($id)');
       } else {
         _cameraStreamId = id;
         setState(() {
@@ -142,23 +148,19 @@ class _CallScreenState extends State<CallScreen> {
     };
 
     _webrtc.onCameraOff = () => _signaling.sendCameraOff();
-
     _webrtc.onScreenShareStopped = () {
       if (mounted) setState(() => _screenSharing = false);
       _signaling.sendScreenOff();
     };
+    _webrtc.onVideoShareStopped = () {
+      if (mounted) setState(() => _videoSharing = false);
+      _signaling.sendScreenOff(); // reuse screen_off signal for viewer cleanup
+    };
 
-    // System-audio PCM arrives here from the sharer's DataChannel.
-    // Route to the correct player depending on platform:
-    //   Web viewer  → WebAudioPlayer (Web Audio API, no native code needed)
-    //   Android viewer → native AudioTrack via MethodChannel
-    //   Initiator (sharer) → ignore (this is our own echo, should not arrive
-    //                         but guard anyway)
+    // Remote audio data (DataChannel PCM) → speaker
     _webrtc.onRemoteAudioData = (Uint8List data) async {
       if (widget.isInitiator) return; // sharer never plays back own audio
       if (kIsWeb) {
-        // Resume AudioContext on first data packet — covers browsers that
-        // require a user gesture before allowing audio output.
         WebAudioPlayer.resume();
         WebAudioPlayer.play(data);
       } else {
@@ -176,11 +178,11 @@ class _CallScreenState extends State<CallScreen> {
       }
     };
 
-    _webrtc.onIceCandidate = (candidate) {
+    _webrtc.onIceCandidate = (c) {
       _signaling.sendCandidate({
-        'candidate': candidate.candidate,
-        'sdpMid': candidate.sdpMid,
-        'sdpMLineIndex': candidate.sdpMLineIndex,
+        'candidate': c.candidate,
+        'sdpMid': c.sdpMid,
+        'sdpMLineIndex': c.sdpMLineIndex,
       });
     };
 
@@ -189,7 +191,7 @@ class _CallScreenState extends State<CallScreen> {
     _signaling = widget.signalingService;
 
     _signaling.onPeerJoined = () {
-      debugPrint('👤 SIGNAL: Peer joined');
+      debugPrint('👤 Peer joined');
       if (!mounted) return;
       setState(() => _isBeingWatched = true);
       _setConnected(true, 'onPeerJoined');
@@ -215,6 +217,7 @@ class _CallScreenState extends State<CallScreen> {
     _signaling.sendOffer(offer.sdp!);
   }
 
+  // ── Signaling ─────────────────────────────────────────────────────────────
   Future<void> _handleSignalingMessage(Map<String, dynamic> msg) async {
     final type = msg['type'] as String;
     debugPrint('📩 CallScreen: $type');
@@ -234,19 +237,18 @@ class _CallScreenState extends State<CallScreen> {
         );
         final answer = await _webrtc.createAnswer();
         _signaling.sendAnswer(answer.sdp!);
-        if (mounted) _setConnected(true, 'offer_answered');
+        _setConnected(true, 'offer_answered');
         break;
 
       case 'answer':
-        final signalingState = await _webrtc.getSignalingState();
-        if (signalingState ==
-            RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+        final st = await _webrtc.getSignalingState();
+        if (st == RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
           await _webrtc.setRemoteDescription(
             RTCSessionDescription(msg['sdp'] as String, 'answer'),
           );
-          if (mounted) _setConnected(true, 'answer_received');
+          _setConnected(true, 'answer_received');
         } else {
-          debugPrint('⚠️ Ignoring answer in wrong state: $signalingState');
+          debugPrint('⚠️ Ignoring answer in state: $st');
         }
         break;
 
@@ -260,16 +262,14 @@ class _CallScreenState extends State<CallScreen> {
         break;
 
       case 'screen_start':
-        debugPrint('🖥️ screen_start — expecting screen stream');
+        // Viewer: next incoming video stream is from sharer (screen or video)
         if (mounted) setState(() => _expectingScreenStream = true);
-        // Only Android viewer needs to pre-start the native AudioTrack.
-        // Web viewer plays via WebAudioPlayer on demand (no pre-start needed).
         if (!widget.isInitiator && !kIsWeb) {
           try {
             await _audioPlaybackChannel.invokeMethod('startAudioPlayback');
             debugPrint('🔊 Viewer AudioTrack started');
           } catch (e) {
-            debugPrint('⚠️ startAudioPlayback error: $e');
+            debugPrint('⚠️ startAudioPlayback: $e');
           }
         }
         break;
@@ -294,13 +294,11 @@ class _CallScreenState extends State<CallScreen> {
           _screenStreamId = null;
           _screenAudioStreamId = null;
           _audioStreamId = null;
-          // Stop native AudioTrack on Android; web just stops receiving data.
           if (!kIsWeb) {
             try {
               await _audioPlaybackChannel.invokeMethod('stopAudioPlayback');
-              debugPrint('🔇 Viewer AudioTrack stopped');
             } catch (e) {
-              debugPrint('⚠️ stopAudioPlayback error: $e');
+              debugPrint('⚠️ stopAudioPlayback: $e');
             }
           }
         }
@@ -308,6 +306,7 @@ class _CallScreenState extends State<CallScreen> {
     }
   }
 
+  // ── Disconnect ────────────────────────────────────────────────────────────
   bool _disconnectShown = false;
   void _handleDisconnect() {
     if (!mounted || _disconnectShown) return;
@@ -336,6 +335,7 @@ class _CallScreenState extends State<CallScreen> {
     );
   }
 
+  // ── Controls ──────────────────────────────────────────────────────────────
   Future<void> _toggleMic() async {
     await _webrtc.toggleMicrophone();
     setState(() => _micOn = _webrtc.micEnabled);
@@ -346,119 +346,57 @@ class _CallScreenState extends State<CallScreen> {
     setState(() => _cameraOn = _webrtc.cameraEnabled);
   }
 
+  // Web: screen share (unchanged)
   Future<void> _toggleScreenShare() async {
-    debugPrint('🚀 _toggleScreenShare clicked');
-
+    debugPrint('🚀 _toggleScreenShare (web)');
     if (_screenSharing) {
       await _webrtc.stopScreenShare();
       setState(() => _screenSharing = false);
     } else {
-      if (kIsWeb) WebAudioPlayer.resume();
-
+      WebAudioPlayer.resume();
       _signaling.sendScreenStart();
       try {
-        final success = await _webrtc.startScreenShare();
-        if (!success) {
+        final ok = await _webrtc.startScreenShare();
+        if (!ok) {
           _signaling.sendScreenOff();
-          if (mounted) _showMobileScreenShareUnsupported();
           return;
         }
-        // Force renegotiation after adding screen track
         final offer = await _webrtc.createOffer();
         _signaling.sendOffer(offer.sdp!);
         setState(() => _screenSharing = _webrtc.screenSharing);
-      } catch (e, stack) {
-        debugPrint('💥 _toggleScreenShare crash: $e\n$stack');
+      } catch (e) {
+        debugPrint('💥 _toggleScreenShare: $e');
         _signaling.sendScreenOff();
       }
     }
   }
 
-  void _showMobileScreenShareUnsupported() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF141420),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (_) => Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 40,
-              height: 4,
-              margin: const EdgeInsets.only(bottom: 28),
-              decoration: BoxDecoration(
-                color: Colors.white12,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            Container(
-              width: 64,
-              height: 64,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: const Color(0xFF6C63FF).withOpacity(0.1),
-                border: Border.all(
-                  color: const Color(0xFF6C63FF).withOpacity(0.3),
-                  width: 1.5,
-                ),
-              ),
-              child: const Icon(
-                Icons.screen_share_rounded,
-                color: Color(0xFF6C63FF),
-                size: 28,
-              ),
-            ),
-            const SizedBox(height: 20),
-            Text(
-              'Screen sharing unavailable',
-              style: GoogleFonts.spaceGrotesk(
-                fontSize: 17,
-                fontWeight: FontWeight.w600,
-                color: Colors.white,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              'Screen sharing is not supported here.\nTry opening the app on a desktop browser.',
-              textAlign: TextAlign.center,
-              style: GoogleFonts.spaceGrotesk(
-                fontSize: 13,
-                color: Colors.white38,
-                height: 1.6,
-              ),
-            ),
-            const SizedBox(height: 28),
-            GestureDetector(
-              onTap: () => Navigator.of(context).pop(),
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(vertical: 14),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(14),
-                  color: const Color(0xFF6C63FF).withOpacity(0.15),
-                  border: Border.all(
-                    color: const Color(0xFF6C63FF).withOpacity(0.3),
-                    width: 1,
-                  ),
-                ),
-                child: Text(
-                  'Got it',
-                  textAlign: TextAlign.center,
-                  style: GoogleFonts.spaceGrotesk(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    color: const Color(0xFF6C63FF),
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
+  // Mobile: video share (replaces screen share)
+  Future<void> _toggleVideoShare() async {
+    debugPrint('🎬 _toggleVideoShare');
+    if (_videoSharing) {
+      await _webrtc.stopVideoShare();
+      setState(() => _videoSharing = false);
+      _signaling.sendScreenOff();
+    } else {
+      _signaling
+          .sendScreenStart(); // reuse signal — viewer expects a new stream
+      final ok = await _webrtc.startVideoShare();
+      if (!ok) {
+        _signaling.sendScreenOff();
+        if (mounted) _showVideoPickCancelled();
+        return;
+      }
+      // Force renegotiation so the new video track reaches the remote peer
+      final offer = await _webrtc.createOffer();
+      _signaling.sendOffer(offer.sdp!);
+      setState(() => _videoSharing = _webrtc.videoSharing);
+    }
+  }
+
+  void _showVideoPickCancelled() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('No video selected')),
     );
   }
 
@@ -488,6 +426,7 @@ class _CallScreenState extends State<CallScreen> {
     );
   }
 
+  // ── Dispose ───────────────────────────────────────────────────────────────
   @override
   void dispose() {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -502,6 +441,7 @@ class _CallScreenState extends State<CallScreen> {
     super.dispose();
   }
 
+  // ── Build ─────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
@@ -513,14 +453,16 @@ class _CallScreenState extends State<CallScreen> {
       body: Stack(
         children: [
           Positioned.fill(child: _buildMainContent()),
+
+          // Hidden audio renderer
           Positioned(
             width: 0,
             height: 0,
-            child: RTCVideoView(
-              _audioRenderer,
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-            ),
+            child: RTCVideoView(_audioRenderer,
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain),
           ),
+
+          // PiP: remote camera
           if (_remoteCameraActive)
             Positioned(
               bottom: 110,
@@ -531,6 +473,8 @@ class _CallScreenState extends State<CallScreen> {
                 height: pipH,
               ),
             ),
+
+          // Top bar
           Positioned(
             top: 0,
             left: 0,
@@ -547,7 +491,7 @@ class _CallScreenState extends State<CallScreen> {
                       children: [
                         if (widget.isInitiator &&
                             _isBeingWatched &&
-                            _screenSharing)
+                            (_screenSharing || _videoSharing))
                           const _LiveBadge(),
                         const SizedBox(width: 10),
                         _EndCallButton(onTap: _endCall),
@@ -558,6 +502,12 @@ class _CallScreenState extends State<CallScreen> {
               ),
             ),
           ),
+
+          // Video player overlay (mobile sharer, when video share is active)
+          if (!kIsWeb && _videoSharing && widget.isInitiator)
+            _buildVideoPlayerOverlay(),
+
+          // Bottom controls
           Positioned(
             bottom: 0,
             left: 0,
@@ -566,10 +516,12 @@ class _CallScreenState extends State<CallScreen> {
               micOn: _micOn,
               cameraOn: _cameraOn,
               screenSharing: _screenSharing,
+              videoSharing: _videoSharing,
               isInitiator: widget.isInitiator,
               onMic: _toggleMic,
               onCamera: _toggleCamera,
-              onScreen: _toggleScreenShare,
+              onScreen: kIsWeb ? _toggleScreenShare : null,
+              onVideo: !kIsWeb && widget.isInitiator ? _toggleVideoShare : null,
             ),
           ),
         ],
@@ -577,6 +529,7 @@ class _CallScreenState extends State<CallScreen> {
     );
   }
 
+  // ── Main content ──────────────────────────────────────────────────────────
   Widget _buildMainContent() {
     if (!widget.isInitiator) {
       if (_remoteScreenActive) {
@@ -605,16 +558,24 @@ class _CallScreenState extends State<CallScreen> {
       );
     }
 
+    // Initiator
     if (_screenSharing) {
       return _SharingView(
           isBeingWatched: _isBeingWatched, roomId: widget.roomId);
+    }
+    if (_videoSharing) {
+      // The video player overlay is rendered in the Stack above this layer.
+      // Show a transparent background here so it shines through.
+      return Container(color: Colors.black);
     }
     if (_connected) {
       return _StatusView(
         icon: Icons.headset_rounded,
         iconColor: const Color(0xFF6C63FF),
         title: 'Connected',
-        subtitle: 'Start screen sharing for your friend to watch',
+        subtitle: kIsWeb
+            ? 'Start screen sharing for your friend to watch'
+            : 'Pick a video to share with your friend',
         roomId: widget.roomId,
       );
     }
@@ -627,14 +588,186 @@ class _CallScreenState extends State<CallScreen> {
       showSpinner: true,
     );
   }
+
+  // ── Video player overlay (mobile sharer) ──────────────────────────────────
+  Widget _buildVideoPlayerOverlay() {
+    final ctrl = _webrtc.videoShare.playerController;
+    if (ctrl == null || !ctrl.value.isInitialized) {
+      return const SizedBox.shrink();
+    }
+    return Positioned.fill(
+      child: Stack(
+        children: [
+          // Black background
+          Container(color: Colors.black),
+
+          // Video
+          Center(
+            child: AspectRatio(
+              aspectRatio: ctrl.value.aspectRatio,
+              child: VideoPlayer(ctrl),
+            ),
+          ),
+
+          // Progress bar + pause/resume
+          Positioned(
+            bottom: 100,
+            left: 20,
+            right: 20,
+            child: _VideoControls(
+              controller: ctrl,
+              onPause: _webrtc.videoShare.pause,
+              onResume: _webrtc.videoShare.resume,
+              onSeek: _webrtc.videoShare.seek,
+            ),
+          ),
+
+          // "LIVE" chip top-left
+          Positioned(
+            top: 60,
+            left: 20,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Container(
+                  width: 7,
+                  height: 7,
+                  decoration: const BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Color(0xFF00E676),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text('SHARING',
+                    style: GoogleFonts.spaceGrotesk(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: const Color(0xFF00E676),
+                      letterSpacing: 1.5,
+                    )),
+              ]),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
-// ── Widgets ───────────────────────────────────────────────────────────────────
+// ── Video player controls ─────────────────────────────────────────────────────
+
+class _VideoControls extends StatefulWidget {
+  final VideoPlayerController controller;
+  final Future<void> Function() onPause;
+  final Future<void> Function() onResume;
+  final Future<void> Function(Duration) onSeek;
+
+  const _VideoControls({
+    required this.controller,
+    required this.onPause,
+    required this.onResume,
+    required this.onSeek,
+  });
+
+  @override
+  State<_VideoControls> createState() => _VideoControlsState();
+}
+
+class _VideoControlsState extends State<_VideoControls> {
+  bool _paused = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<VideoPlayerValue>(
+      valueListenable: widget.controller,
+      builder: (_, value, __) {
+        final pos = value.position;
+        final dur = value.duration;
+        final progress = dur.inMilliseconds > 0
+            ? pos.inMilliseconds / dur.inMilliseconds
+            : 0.0;
+
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Seek bar
+            SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                activeTrackColor: const Color(0xFF6C63FF),
+                inactiveTrackColor: Colors.white24,
+                thumbColor: const Color(0xFF6C63FF),
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                overlayShape: SliderComponentShape.noOverlay,
+              ),
+              child: Slider(
+                value: progress.clamp(0.0, 1.0),
+                onChanged: (v) {
+                  final target = Duration(
+                    milliseconds: (v * dur.inMilliseconds).round(),
+                  );
+                  widget.onSeek(target);
+                },
+              ),
+            ),
+
+            // Time + play/pause
+            Row(
+              children: [
+                Text(
+                  '${_fmt(pos)} / ${_fmt(dur)}',
+                  style: GoogleFonts.jetBrainsMono(
+                    fontSize: 11,
+                    color: Colors.white54,
+                  ),
+                ),
+                const Spacer(),
+                GestureDetector(
+                  onTap: () async {
+                    if (_paused) {
+                      await widget.onResume();
+                    } else {
+                      await widget.onPause();
+                    }
+                    setState(() => _paused = !_paused);
+                  },
+                  child: Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.white.withOpacity(0.15),
+                    ),
+                    child: Icon(
+                      _paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                      color: Colors.white,
+                      size: 22,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  String _fmt(Duration d) {
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+}
+
+// ── Reusable widgets (unchanged from original) ────────────────────────────────
 
 class _CameraPiP extends StatelessWidget {
   final RTCVideoRenderer renderer;
-  final double width;
-  final double height;
+  final double width, height;
   const _CameraPiP(
       {required this.renderer, required this.width, required this.height});
 
@@ -651,9 +784,10 @@ class _CameraPiP extends StatelessWidget {
           border: Border.all(color: Colors.white10, width: 1),
           boxShadow: [
             BoxShadow(
-                color: Colors.black.withOpacity(0.5),
-                blurRadius: 12,
-                offset: const Offset(0, 4))
+              color: Colors.black.withOpacity(0.5),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            )
           ],
         ),
         child: RTCVideoView(renderer,
@@ -674,49 +808,45 @@ class _SharingView extends StatelessWidget {
     return Container(
       color: const Color(0xFF0A0A0F),
       child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 72,
-              height: 72,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: const Color(0xFF0ECFCF).withOpacity(0.1),
-                border: Border.all(
-                    color: const Color(0xFF0ECFCF).withOpacity(0.35),
-                    width: 1.5),
-              ),
-              child: const Icon(Icons.screen_share_rounded,
-                  color: Color(0xFF0ECFCF), size: 30),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 72,
+            height: 72,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: const Color(0xFF0ECFCF).withOpacity(0.1),
+              border: Border.all(
+                  color: const Color(0xFF0ECFCF).withOpacity(0.35), width: 1.5),
             ),
-            const SizedBox(height: 20),
-            Text('Sharing your screen',
-                style: GoogleFonts.spaceGrotesk(
-                    fontSize: 17,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white)),
-            const SizedBox(height: 8),
-            AnimatedSwitcher(
-              duration: const Duration(milliseconds: 300),
-              child: Text(
-                isBeingWatched
-                    ? 'Your friend is watching  👀'
-                    : 'Waiting for your friend...',
-                key: ValueKey(isBeingWatched),
-                style: GoogleFonts.spaceGrotesk(
-                    fontSize: 13,
-                    color: isBeingWatched
-                        ? const Color(0xFF00E676)
-                        : Colors.white38),
+            child: const Icon(Icons.screen_share_rounded,
+                color: Color(0xFF0ECFCF), size: 30),
+          ),
+          const SizedBox(height: 20),
+          Text('Sharing your screen',
+              style: GoogleFonts.spaceGrotesk(
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white)),
+          const SizedBox(height: 8),
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 300),
+            child: Text(
+              isBeingWatched
+                  ? 'Your friend is watching  👀'
+                  : 'Waiting for your friend...',
+              key: ValueKey(isBeingWatched),
+              style: GoogleFonts.spaceGrotesk(
+                fontSize: 13,
+                color:
+                    isBeingWatched ? const Color(0xFF00E676) : Colors.white38,
               ),
             ),
-            const SizedBox(height: 28),
-            Text(roomId,
-                style: GoogleFonts.jetBrainsMono(
-                    fontSize: 12, color: Colors.white12, letterSpacing: 3)),
-          ],
-        ),
+          ),
+          const SizedBox(height: 28),
+          Text(roomId,
+              style: GoogleFonts.jetBrainsMono(
+                  fontSize: 12, color: Colors.white12, letterSpacing: 3)),
+        ]),
       ),
     );
   }
@@ -725,11 +855,8 @@ class _SharingView extends StatelessWidget {
 class _StatusView extends StatelessWidget {
   final IconData? icon;
   final Color iconColor;
-  final String title;
-  final String subtitle;
-  final String roomId;
+  final String title, subtitle, roomId;
   final bool showSpinner;
-
   const _StatusView({
     required this.icon,
     required this.iconColor,
@@ -744,49 +871,47 @@ class _StatusView extends StatelessWidget {
     return Container(
       color: const Color(0xFF0A0A0F),
       child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (showSpinner)
-              const SizedBox(
-                  width: 36,
-                  height: 36,
-                  child: CircularProgressIndicator(
-                      color: Color(0xFF6C63FF), strokeWidth: 2))
-            else if (icon != null)
-              Container(
-                width: 64,
-                height: 64,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: iconColor.withOpacity(0.1),
-                  border:
-                      Border.all(color: iconColor.withOpacity(0.3), width: 1.5),
-                ),
-                child: Icon(icon, color: iconColor, size: 28),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          if (showSpinner)
+            const SizedBox(
+              width: 36,
+              height: 36,
+              child: CircularProgressIndicator(
+                  color: Color(0xFF6C63FF), strokeWidth: 2),
+            )
+          else if (icon != null)
+            Container(
+              width: 64,
+              height: 64,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: iconColor.withOpacity(0.1),
+                border:
+                    Border.all(color: iconColor.withOpacity(0.3), width: 1.5),
               ),
-            const SizedBox(height: 20),
-            Text(title,
-                style: GoogleFonts.spaceGrotesk(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white)),
-            if (subtitle.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 40),
-                child: Text(subtitle,
-                    textAlign: TextAlign.center,
-                    style: GoogleFonts.spaceGrotesk(
-                        fontSize: 13, color: Colors.white38)),
-              ),
-            ],
-            const SizedBox(height: 24),
-            Text(roomId,
-                style: GoogleFonts.jetBrainsMono(
-                    fontSize: 12, color: Colors.white12, letterSpacing: 3)),
+              child: Icon(icon, color: iconColor, size: 28),
+            ),
+          const SizedBox(height: 20),
+          Text(title,
+              style: GoogleFonts.spaceGrotesk(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white)),
+          if (subtitle.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 40),
+              child: Text(subtitle,
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.spaceGrotesk(
+                      fontSize: 13, color: Colors.white38)),
+            ),
           ],
-        ),
+          const SizedBox(height: 24),
+          Text(roomId,
+              style: GoogleFonts.jetBrainsMono(
+                  fontSize: 12, color: Colors.white12, letterSpacing: 3)),
+        ]),
       ),
     );
   }
@@ -796,75 +921,73 @@ class _RoomChip extends StatelessWidget {
   final String roomId;
   const _RoomChip({required this.roomId});
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-      decoration: BoxDecoration(
-          color: Colors.black45, borderRadius: BorderRadius.circular(20)),
-      child: Text(roomId,
-          style: GoogleFonts.jetBrainsMono(
-              fontSize: 14, color: Colors.white60, letterSpacing: 2)),
-    );
-  }
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+        decoration: BoxDecoration(
+            color: Colors.black45, borderRadius: BorderRadius.circular(20)),
+        child: Text(roomId,
+            style: GoogleFonts.jetBrainsMono(
+                fontSize: 14, color: Colors.white60, letterSpacing: 2)),
+      );
 }
 
 class _LiveBadge extends StatelessWidget {
   const _LiveBadge();
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-      decoration: BoxDecoration(
-          color: Colors.black45, borderRadius: BorderRadius.circular(20)),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Container(
-            width: 7,
-            height: 7,
-            decoration: const BoxDecoration(
-                shape: BoxShape.circle, color: Color(0xFF00E676))),
-        const SizedBox(width: 6),
-        Text('LIVE',
-            style: GoogleFonts.spaceGrotesk(
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-                color: const Color(0xFF00E676),
-                letterSpacing: 1.5)),
-      ]),
-    );
-  }
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+            color: Colors.black45, borderRadius: BorderRadius.circular(20)),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+              width: 7,
+              height: 7,
+              decoration: const BoxDecoration(
+                  shape: BoxShape.circle, color: Color(0xFF00E676))),
+          const SizedBox(width: 6),
+          Text('LIVE',
+              style: GoogleFonts.spaceGrotesk(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  color: const Color(0xFF00E676),
+                  letterSpacing: 1.5)),
+        ]),
+      );
 }
 
 class _EndCallButton extends StatelessWidget {
   final VoidCallback onTap;
   const _EndCallButton({required this.onTap});
   @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 40,
-        height: 40,
-        decoration: BoxDecoration(
-            shape: BoxShape.circle, color: Colors.red.withOpacity(0.85)),
-        child:
-            const Icon(Icons.call_end_rounded, color: Colors.white, size: 20),
-      ),
-    );
-  }
+  Widget build(BuildContext context) => GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 40,
+          height: 40,
+          decoration: BoxDecoration(
+              shape: BoxShape.circle, color: Colors.red.withOpacity(0.85)),
+          child:
+              const Icon(Icons.call_end_rounded, color: Colors.white, size: 20),
+        ),
+      );
 }
 
 class _BottomControls extends StatelessWidget {
-  final bool micOn, cameraOn, screenSharing, isInitiator;
-  final VoidCallback onMic, onCamera, onScreen;
+  final bool micOn, cameraOn, screenSharing, videoSharing, isInitiator;
+  final VoidCallback onMic, onCamera;
+  final VoidCallback? onScreen; // web only — null on mobile
+  final VoidCallback? onVideo; // mobile only — null on web / viewer
 
   const _BottomControls({
     required this.micOn,
     required this.cameraOn,
     required this.screenSharing,
+    required this.videoSharing,
     required this.isInitiator,
     required this.onMic,
     required this.onCamera,
-    required this.onScreen,
+    this.onScreen,
+    this.onVideo,
   });
 
   @override
@@ -876,27 +999,45 @@ class _BottomControls extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             _ControlButton(
-                icon: micOn ? Icons.mic_rounded : Icons.mic_off_rounded,
-                active: micOn,
-                onTap: onMic),
+              icon: micOn ? Icons.mic_rounded : Icons.mic_off_rounded,
+              active: micOn,
+              onTap: onMic,
+            ),
             const SizedBox(width: 20),
-            if (isInitiator) ...[
+
+            // Web: screen share button
+            if (onScreen != null) ...[
               _ControlButton(
                 icon: screenSharing
                     ? Icons.stop_screen_share_rounded
                     : Icons.screen_share_rounded,
                 active: screenSharing,
                 activeColor: const Color(0xFF0ECFCF),
-                onTap: onScreen,
+                onTap: onScreen!,
               ),
               const SizedBox(width: 20),
             ],
+
+            // Mobile initiator: video share button
+            if (onVideo != null) ...[
+              _ControlButton(
+                icon: videoSharing
+                    ? Icons.stop_circle_outlined
+                    : Icons.video_library_rounded,
+                active: videoSharing,
+                activeColor: const Color(0xFF0ECFCF),
+                onTap: onVideo!,
+              ),
+              const SizedBox(width: 20),
+            ],
+
             _ControlButton(
-                icon: cameraOn
-                    ? Icons.videocam_rounded
-                    : Icons.videocam_off_rounded,
-                active: cameraOn,
-                onTap: onCamera),
+              icon: cameraOn
+                  ? Icons.videocam_rounded
+                  : Icons.videocam_off_rounded,
+              active: cameraOn,
+              onTap: onCamera,
+            ),
           ],
         ),
       ),
@@ -918,29 +1059,27 @@ class _ControlButton extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        width: 60,
-        height: 60,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: active
-              ? activeColor.withOpacity(0.9)
-              : Colors.white.withOpacity(0.12),
-          boxShadow: active
-              ? [
-                  BoxShadow(
-                      color: activeColor.withOpacity(0.4),
-                      blurRadius: 20,
-                      spreadRadius: 2)
-                ]
-              : null,
+  Widget build(BuildContext context) => GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          width: 60,
+          height: 60,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: active
+                ? activeColor.withOpacity(0.9)
+                : Colors.white.withOpacity(0.12),
+            boxShadow: active
+                ? [
+                    BoxShadow(
+                        color: activeColor.withOpacity(0.4),
+                        blurRadius: 20,
+                        spreadRadius: 2)
+                  ]
+                : null,
+          ),
+          child: Icon(icon, color: Colors.white, size: 26),
         ),
-        child: Icon(icon, color: Colors.white, size: 26),
-      ),
-    );
-  }
+      );
 }

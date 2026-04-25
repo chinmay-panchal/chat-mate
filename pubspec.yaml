@@ -14,6 +14,8 @@ dependencies:
   web_socket_channel: ^2.4.0
   cupertino_icons: ^1.0.8
   google_fonts: ^8.0.2
+  video_player: ^2.9.2
+  file_picker: ^8.1.2
 
 dependency_overrides:        # ← must be its own top-level key
   flutter_webrtc:
