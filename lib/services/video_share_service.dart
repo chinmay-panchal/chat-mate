@@ -70,7 +70,7 @@ class VideoShareService {
       await _ch.invokeMethod('startVideoShareAudio', {'filePath': path});
 
       // ── 3. Create custom WebRTC video track (native) ──────────────────────
-      await _ch.invokeMethod(
+      await _webrtcCh.invokeMethod(
         'createCustomVideoTrack',
         {'trackId': _videoTrackId},
       );
@@ -176,7 +176,7 @@ class VideoShareService {
     } catch (_) {}
 
     try {
-      await _ch
+      await _webrtcCh
           .invokeMethod('disposeCustomVideoTrack', {'trackId': _videoTrackId});
     } catch (_) {}
 
