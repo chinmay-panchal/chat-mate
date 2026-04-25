@@ -1,8 +1,8 @@
-// Native (mobile) implementation of AudioCaptureService.
-// Mirrors the stub interface exactly so the conditional import works.
-
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
+
+// Native (mobile) implementation of AudioCaptureService.
+// Mirrors the stub interface exactly so the conditional import works.
 
 class AudioCaptureService {
   static const _ch = MethodChannel('com.example.chat_mate/screen_share');
@@ -15,9 +15,7 @@ class AudioCaptureService {
     });
     try {
       await _ch.invokeMethod('startAudioCapture');
-    } catch (e) {
-      // Native method may not be implemented yet — fail silently.
-    }
+    } catch (_) {}
   }
 
   Future<void> stop() async {
