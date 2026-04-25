@@ -92,6 +92,7 @@ class _CallScreenState extends State<CallScreen> {
       debugPrint('🔄 Renegotiating...');
       final offer = await _webrtc.createOffer();
       _signaling.sendOffer(offer.sdp!);
+      // Lock stays held until answer arrives
     };
 
     _webrtc.onRemoteStream = (stream, trackKind) {
@@ -246,12 +247,12 @@ class _CallScreenState extends State<CallScreen> {
           await _webrtc.setRemoteDescription(
             RTCSessionDescription(msg['sdp'] as String, 'answer'),
           );
+          _webrtc.isNegotiating = false; // unlock for next renegotiation
           _setConnected(true, 'answer_received');
         } else {
           debugPrint('⚠️ Ignoring answer in state: $st');
         }
         break;
-
       case 'candidate':
         final c = msg['candidate'] as Map<String, dynamic>;
         await _webrtc.addIceCandidate(RTCIceCandidate(
@@ -379,17 +380,14 @@ class _CallScreenState extends State<CallScreen> {
       setState(() => _videoSharing = false);
       _signaling.sendScreenOff();
     } else {
-      _signaling
-          .sendScreenStart(); // reuse signal — viewer expects a new stream
+      _signaling.sendScreenStart();
       final ok = await _webrtc.startVideoShare();
       if (!ok) {
         _signaling.sendScreenOff();
         if (mounted) _showVideoPickCancelled();
         return;
       }
-      // Force renegotiation so the new video track reaches the remote peer
-      final offer = await _webrtc.createOffer();
-      _signaling.sendOffer(offer.sdp!);
+      // onNegotiationNeeded fires automatically when track is added
       setState(() => _videoSharing = _webrtc.videoSharing);
     }
   }

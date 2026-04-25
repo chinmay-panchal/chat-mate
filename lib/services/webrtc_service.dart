@@ -19,6 +19,8 @@ class WebRTCService {
   MediaStream? _cameraStream;
   // Screen share kept but only active on web:
   MediaStream? _screenStream;
+  bool _isNegotiating = false;
+  set isNegotiating(bool v) => _isNegotiating = v;
 
   bool _micEnabled = true;
   bool _cameraEnabled = false;
@@ -26,7 +28,7 @@ class WebRTCService {
   bool _videoSharing = false; // mobile only
 
   OnTrackCallback? onRemoteStream;
-  VoidCallback? onNegotiationNeeded;
+  Future<void> Function()? onNegotiationNeeded;
   VoidCallback? onLocalCameraStopped;
   VoidCallback? onScreenShareStopped;
   VoidCallback? onCameraOff;
@@ -105,9 +107,18 @@ class WebRTCService {
 
     _peerConnection!.onConnectionState = (s) => onConnectionState?.call(s);
 
-    _peerConnection!.onRenegotiationNeeded = () {
+    _peerConnection!.onRenegotiationNeeded = () async {
+      if (_isNegotiating) {
+        debugPrint('⏭️ Skipping renegotiation — already in progress');
+        return;
+      }
+      _isNegotiating = true;
       debugPrint('🔄 renegotiation needed');
-      if (_isInitiator) onNegotiationNeeded?.call();
+      try {
+        if (_isInitiator) await onNegotiationNeeded?.call();
+      } finally {
+        // Keep locked until answer is received — reset via isNegotiating setter
+      }
     };
 
     _peerConnection!.onDataChannel = (RTCDataChannel channel) {
