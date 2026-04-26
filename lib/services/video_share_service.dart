@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -59,42 +58,40 @@ class VideoShareService {
     _filePath = path;
 
     try {
-      // ── 1. video_player (MUTED — audio comes from native pipeline) ───────
+// 1. Init player (muted)
       _player = VideoPlayerController.contentUri(Uri.parse('file://$path'));
       await _player!.initialize();
       await _player!.setVolume(0.0);
       await _player!.setLooping(false);
+      debugPrint('✅ VideoShareService: player initialized');
 
-// ── 2. Native audio decode (speaker + PCM callbacks) ─────────────────
+// 2. Start audio decode
       _ch.setMethodCallHandler(_handleNativeCall);
       await _ch.invokeMethod('startVideoShareAudio', {'filePath': path});
+      debugPrint('✅ VideoShareService: audio decode started');
 
-      // ── 2b. Native video decode (frame capture pipeline) ──────────────────
-      await _ch.invokeMethod('startVideoShareVideo', {'filePath': path});
+// 3. Create custom WebRTC video track
+      await _webrtcCh
+          .invokeMethod('createCustomVideoTrack', {'trackId': _videoTrackId});
+      debugPrint(
+          '✅ VideoShareService: custom track created — activeInstances should now have it');
 
-      // ── 3. Create custom WebRTC video track (native) ──────────────────────
-      await _webrtcCh.invokeMethod(
-        'createCustomVideoTrack',
-        {'trackId': _videoTrackId},
-      );
-
-      // ── 4. Add custom track to peer connection via flutter_webrtc channel ─
+// 4. Add track to peer connection
+// CustomVideoSource is now in activeInstances, so decode thread won't drop frames
       final added = await _addCustomTrackToPeerConnection(pc);
-      if (added) {
-        debugPrint('✅ VideoShareService: video track added to PC');
-      } else {
-        debugPrint(
-            '⚠️ VideoShareService: could not add video track — audio only');
-      }
+      debugPrint('✅ VideoShareService: addTrack result=$added');
 
-      // ── 5. Start playback ─────────────────────────────────────────────────
+// 5. Start video decode — MUST be after step 3 so activeInstances is populated
+      await _ch.invokeMethod('startVideoShareVideo', {'filePath': path});
+      debugPrint(
+          '✅ VideoShareService: video decode started (direct push mode)');
+
+// 6. Start UI player
       await _player!.play();
-
-      // ── 6. Frame pump ─────────────────────────────────────────────────────
-      _startFramePump();
+      debugPrint('✅ VideoShareService: player playing');
 
       _active = true;
-      debugPrint('✅ VideoShareService started: $path');
+      debugPrint('✅ VideoShareService fully started: $path');
       return true;
     } catch (e, st) {
       debugPrint('❌ VideoShareService.startWithPath: $e\n$st');
@@ -171,33 +168,26 @@ class VideoShareService {
   }
 
   Future<void> _cleanup(RTCPeerConnection pc) async {
-    _framePumpTimer?.cancel();
-    _framePumpTimer = null;
-
     try {
       await _ch.invokeMethod('stopVideoShareAudio');
     } catch (_) {}
-
     try {
       await _ch.invokeMethod('stopVideoShareVideo');
     } catch (_) {}
-
     try {
       await _webrtcCh
           .invokeMethod('disposeCustomVideoTrack', {'trackId': _videoTrackId});
     } catch (_) {}
-
     if (_videoSender != null) {
       try {
         await pc.removeTrack(_videoSender!);
       } catch (_) {}
       _videoSender = null;
     }
-
     await _player?.dispose();
     _player = null;
     _filePath = null;
-    debugPrint('🛑 VideoShareService stopped');
+    debugPrint('🛑 VideoShareService cleanup complete');
   }
 
   void dispose() {

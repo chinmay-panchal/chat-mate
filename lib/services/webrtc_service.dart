@@ -276,10 +276,11 @@ class WebRTCService {
   // ── Camera ────────────────────────────────────────────────────────────────
   Future<void> toggleCamera() async {
     _cameraEnabled = !_cameraEnabled;
-    if (_cameraEnabled)
+    if (_cameraEnabled) {
       await _startCamera();
-    else
+    } else {
       await _stopCamera();
+    }
   }
 
   Future<void> _startCamera() async {

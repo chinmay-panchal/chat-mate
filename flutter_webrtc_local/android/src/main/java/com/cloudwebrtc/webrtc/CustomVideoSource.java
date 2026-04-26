@@ -31,16 +31,19 @@ public class CustomVideoSource {
     private final VideoTrack videoTrack;
     private final String trackId;
 
+    public static final java.util.concurrent.ConcurrentHashMap<String, CustomVideoSource> activeInstances = new java.util.concurrent.ConcurrentHashMap<>();
+
     // Scratch buffers — reallocated only on dimension change
     private ByteBuffer yBuf, uBuf, vBuf;
     private int lastW = 0, lastH = 0;
 
     public CustomVideoSource(PeerConnectionFactory factory, String trackId) {
         this.trackId = trackId;
-        this.videoSource = factory.createVideoSource(false /* isScreencast */);
+        this.videoSource = factory.createVideoSource(false);
         this.videoTrack = factory.createVideoTrack(trackId, videoSource);
         this.videoTrack.setEnabled(true);
-        Log.d(TAG, "✅ CustomVideoSource created: " + trackId);
+        activeInstances.put(trackId, this);  // ← ADD THIS
+        Log.d(TAG, "✅ CustomVideoSource created and registered: " + trackId);
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -95,6 +98,7 @@ public class CustomVideoSource {
     }
 
     public void dispose() {
+        activeInstances.remove(trackId);     // ← ADD THIS
         videoTrack.setEnabled(false);
         videoTrack.dispose();
         videoSource.dispose();
