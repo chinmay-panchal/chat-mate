@@ -65,9 +65,12 @@ class VideoShareService {
       await _player!.setVolume(0.0);
       await _player!.setLooping(false);
 
-      // ── 2. Native audio decode (speaker + PCM callbacks) ─────────────────
+// ── 2. Native audio decode (speaker + PCM callbacks) ─────────────────
       _ch.setMethodCallHandler(_handleNativeCall);
       await _ch.invokeMethod('startVideoShareAudio', {'filePath': path});
+
+      // ── 2b. Native video decode (frame capture pipeline) ──────────────────
+      await _ch.invokeMethod('startVideoShareVideo', {'filePath': path});
 
       // ── 3. Create custom WebRTC video track (native) ──────────────────────
       await _webrtcCh.invokeMethod(
@@ -176,6 +179,10 @@ class VideoShareService {
     } catch (_) {}
 
     try {
+      await _ch.invokeMethod('stopVideoShareVideo');
+    } catch (_) {}
+
+    try {
       await _webrtcCh
           .invokeMethod('disposeCustomVideoTrack', {'trackId': _videoTrackId});
     } catch (_) {}
@@ -206,8 +213,16 @@ class VideoShareService {
       if (!_active) return;
       if (_player?.value.isPlaying != true) return;
       try {
-        await _ch.invokeMethod('pushLatestVideoFrame', {
+        // Capture current frame from video player as RGBA bytes
+        final bytes = await _captureVideoFrame();
+        if (bytes == null) return;
+        final width = _player!.value.size.width.toInt();
+        final height = _player!.value.size.height.toInt();
+        await _webrtcCh.invokeMethod('pushVideoFrame', {
           'trackId': _videoTrackId,
+          'rgba': bytes,
+          'width': width,
+          'height': height,
         });
       } catch (e) {
         debugPrint('⚠️ framePump error: $e');
@@ -215,6 +230,18 @@ class VideoShareService {
     });
   }
 
+  Future<Uint8List?> _captureVideoFrame() async {
+    try {
+      // Use the native channel to grab the latest decoded frame from ExoPlayer
+      final result = await _ch.invokeMethod<Uint8List>('captureVideoFrame', {
+        'trackId': _videoTrackId,
+      });
+      return result;
+    } catch (e) {
+      debugPrint('⚠️ captureVideoFrame error: $e');
+      return null;
+    }
+  }
   // ── Native callbacks ──────────────────────────────────────────────────────────
 
   Future<dynamic> _handleNativeCall(MethodCall call) async {

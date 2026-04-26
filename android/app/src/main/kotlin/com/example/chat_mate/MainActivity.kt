@@ -4,10 +4,14 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.graphics.Bitmap
+import android.graphics.ImageFormat
+import android.graphics.PixelFormat
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -17,6 +21,7 @@ import android.util.Log
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.nio.ByteBuffer
 
 class MainActivity : FlutterFragmentActivity() {
 
@@ -25,10 +30,10 @@ class MainActivity : FlutterFragmentActivity() {
         private const val METHOD_CHANNEL = "com.example.chat_mate/screen_share"
     }
 
-    // ── Existing: screen share AudioTrack (viewer side) ───────────────────────
+    // ── Screen share AudioTrack (viewer side) ─────────────────────────────────
     private var audioTrack: AudioTrack? = null
 
-    // ── Existing: screen share FGS ────────────────────────────────────────────
+    // ── Screen share FGS ──────────────────────────────────────────────────────
     private var screenServiceBound = false
     private var pendingFgsResult: MethodChannel.Result? = null
 
@@ -45,15 +50,24 @@ class MainActivity : FlutterFragmentActivity() {
         }
     }
 
-    // ── NEW: video share audio decode pipeline ────────────────────────────────
+    // ── Video share: audio decode pipeline ───────────────────────────────────
     private var vsExtractor:  MediaExtractor? = null
     private var vsCodec:      MediaCodec?     = null
     private var vsSpeaker:    AudioTrack?     = null
     private var vsThread:     Thread?         = null
     @Volatile private var vsRunning = false
-    private var vsChannel:    MethodChannel?  = null   // for PCM callback to Dart
+    private var vsChannel:    MethodChannel?  = null
 
-    // ── Existing ──────────────────────────────────────────────────────────────
+    // ── Video share: video decode pipeline ───────────────────────────────────
+    private var vvExtractor:  MediaExtractor? = null
+    private var vvCodec:      MediaCodec?     = null
+    private var vvImageReader: ImageReader?   = null
+    private var vvThread:     Thread?         = null
+    @Volatile private var vvRunning = false
+    @Volatile private var currentVideoBitmap: Bitmap? = null
+    private var vvWidth  = 0
+    private var vvHeight = 0
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode == android.app.Activity.RESULT_OK && data != null) {
@@ -69,7 +83,6 @@ class MainActivity : FlutterFragmentActivity() {
         )
         vsChannel = methodChannel
 
-        // Existing: forward native audio capture bytes to Dart
         ScreenShareForegroundService.audioDataChannelCallback = { bytes ->
             runOnUiThread { methodChannel.invokeMethod("onAudioCaptured", bytes) }
         }
@@ -77,7 +90,7 @@ class MainActivity : FlutterFragmentActivity() {
         methodChannel.setMethodCallHandler { call, result ->
             when (call.method) {
 
-                // ── Existing: screen share FGS ────────────────────────────────
+                // ── Screen share FGS ──────────────────────────────────────────
 
                 "startScreenCaptureFgs" -> {
                     try {
@@ -114,14 +127,14 @@ class MainActivity : FlutterFragmentActivity() {
                     }
                 }
 
-                // ── Existing: viewer-side AudioTrack (screen share audio) ─────
+                // ── Viewer-side AudioTrack ─────────────────────────────────────
 
                 "startAudioPlayback" -> {
                     try {
-                        val sr   = 48000
-                        val ch   = AudioFormat.CHANNEL_OUT_STEREO
-                        val fmt  = AudioFormat.ENCODING_PCM_16BIT
-                        val min  = AudioTrack.getMinBufferSize(sr, ch, fmt)
+                        val sr  = 48000
+                        val ch  = AudioFormat.CHANNEL_OUT_STEREO
+                        val fmt = AudioFormat.ENCODING_PCM_16BIT
+                        val min = AudioTrack.getMinBufferSize(sr, ch, fmt)
                         audioTrack?.stop(); audioTrack?.release()
                         audioTrack = AudioTrack.Builder()
                             .setAudioAttributes(
@@ -160,7 +173,7 @@ class MainActivity : FlutterFragmentActivity() {
                     result.success(null)
                 }
 
-                // ── Existing: internal audio capture (screen share, Android 10+) ─
+                // ── Internal audio capture (screen share) ─────────────────────
 
                 "startInternalAudioCapture" -> {
                     try {
@@ -201,7 +214,7 @@ class MainActivity : FlutterFragmentActivity() {
                     }
                 }
 
-                // ── NEW: video share audio decode ─────────────────────────────
+                // ── Video share: audio ─────────────────────────────────────────
 
                 "startVideoShareAudio" -> {
                     val filePath = call.argument<String>("filePath")
@@ -234,8 +247,7 @@ class MainActivity : FlutterFragmentActivity() {
                     if (vsCodec != null) {
                         vsRunning = true
                         vsSpeaker?.play()
-                        // Restart decode loop on a new thread
-                        vsThread = buildDecodeThread()
+                        vsThread = buildAudioDecodeThread()
                         vsThread?.start()
                     }
                     result.success(null)
@@ -247,26 +259,44 @@ class MainActivity : FlutterFragmentActivity() {
                     result.success(null)
                 }
 
-                // ── NEW: custom video track stubs (video frame pipeline) ───────
-                // These are acknowledged here so Dart doesn't throw
-                // MissingPluginException. Real VideoTrackSource wiring lives in
-                // the flutter_webrtc_local native patch. If that patch is not yet
-                // implemented, video frames won't reach the remote peer but the
-                // app will not crash.
+                // ── Video share: video frame capture ──────────────────────────
 
-                "createCustomVideoTrack" -> {
-                    Log.d(TAG, "ℹ️ createCustomVideoTrack: acknowledged")
+                "startVideoShareVideo" -> {
+                    val filePath = call.argument<String>("filePath")
+                    if (filePath == null) {
+                        result.error("NO_PATH", "filePath required", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        stopVideoShareVideoInternal()
+                        startVideoShareVideoInternal(filePath)
+                        result.success(null)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "❌ startVideoShareVideo: ${e.message}", e)
+                        result.error("VIDEO_DECODE_ERROR", e.message, null)
+                    }
+                }
+
+                "stopVideoShareVideo" -> {
+                    stopVideoShareVideoInternal()
                     result.success(null)
                 }
 
-                "disposeCustomVideoTrack" -> {
-                    Log.d(TAG, "ℹ️ disposeCustomVideoTrack: acknowledged")
-                    result.success(null)
-                }
-
-                "pushLatestVideoFrame" -> {
-                    // No-op until real VideoTrackSource is wired in the native patch
-                    result.success(null)
+                "captureVideoFrame" -> {
+                    val bmp = currentVideoBitmap
+                    if (bmp != null && !bmp.isRecycled) {
+                        try {
+                            val buf = ByteArray(bmp.width * bmp.height * 4)
+                            val wrapped = ByteBuffer.wrap(buf)
+                            bmp.copyPixelsToBuffer(wrapped)
+                            result.success(buf)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ captureVideoFrame copy: ${e.message}")
+                            result.success(null)
+                        }
+                    } else {
+                        result.success(null)
+                    }
                 }
 
                 else -> result.notImplemented()
@@ -274,13 +304,157 @@ class MainActivity : FlutterFragmentActivity() {
         }
     }
 
-    // ── Video share audio internals ────────────────────────────────────────────
+    // ── Video share: VIDEO decode internals ───────────────────────────────────
+
+    private fun startVideoShareVideoInternal(filePath: String) {
+        val extractor = MediaExtractor()
+        extractor.setDataSource(filePath)
+
+        var videoIdx = -1
+        var mime     = ""
+        var width    = 0
+        var height   = 0
+
+        for (i in 0 until extractor.trackCount) {
+            val fmt = extractor.getTrackFormat(i)
+            val m   = fmt.getString(MediaFormat.KEY_MIME) ?: ""
+            if (m.startsWith("video/")) {
+                videoIdx = i
+                mime     = m
+                width    = fmt.getInteger(MediaFormat.KEY_WIDTH)
+                height   = fmt.getInteger(MediaFormat.KEY_HEIGHT)
+                Log.d(TAG, "🎬 Video track: mime=$m ${width}x${height}")
+                break
+            }
+        }
+        if (videoIdx == -1) throw Exception("No video track in file")
+
+        extractor.selectTrack(videoIdx)
+
+        // ImageReader in RGBA_8888 so we can copy pixels directly to Bitmap
+        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 4)
+
+        val codec = MediaCodec.createDecoderByType(mime)
+        codec.configure(extractor.getTrackFormat(videoIdx), imageReader.surface, null, 0)
+        codec.start()
+
+        vvExtractor  = extractor
+        vvCodec      = codec
+        vvImageReader = imageReader
+        vvWidth      = width
+        vvHeight     = height
+        vvRunning    = true
+
+        // ImageReader listener: grab latest frame as Bitmap
+        imageReader.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                val plane  = image.planes[0]
+                val buffer = plane.buffer
+                val rowStride   = plane.rowStride
+                val pixelStride = plane.pixelStride
+                val w = image.width
+                val h = image.height
+
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                // Copy row by row accounting for padding
+                val rowData = ByteArray(rowStride)
+                val bmpBuf  = ByteBuffer.allocate(w * h * 4)
+                for (row in 0 until h) {
+                    buffer.position(row * rowStride)
+                    buffer.get(rowData, 0, minOf(rowStride, buffer.remaining()))
+                    if (pixelStride == 4) {
+                        bmpBuf.put(rowData, 0, w * 4)
+                    } else {
+                        // pixelStride == 1 shouldn't happen for RGBA but handle gracefully
+                        for (col in 0 until w) {
+                            bmpBuf.put(rowData, col * pixelStride, 4)
+                        }
+                    }
+                }
+                bmpBuf.rewind()
+                bmp.copyPixelsFromBuffer(bmpBuf)
+
+                val old = currentVideoBitmap
+                currentVideoBitmap = bmp
+                old?.recycle()
+            } catch (e: Exception) {
+                Log.w(TAG, "⚠️ ImageReader frame error: ${e.message}")
+            } finally {
+                image.close()
+            }
+        }, null)
+
+        vvThread = buildVideoDecodeThread()
+        vvThread?.start()
+        Log.d(TAG, "✅ Video share video decode started: $filePath")
+    }
+
+    private fun buildVideoDecodeThread(): Thread {
+        val extractor = vvExtractor!!
+        val codec     = vvCodec!!
+
+        return Thread {
+            val info      = MediaCodec.BufferInfo()
+            var inputDone = false
+            var outDone   = false
+
+            while (vvRunning && !outDone) {
+                if (!inputDone) {
+                    val inIdx = codec.dequeueInputBuffer(10_000)
+                    if (inIdx >= 0) {
+                        val buf  = codec.getInputBuffer(inIdx)!!
+                        val size = extractor.readSampleData(buf, 0)
+                        if (size < 0) {
+                            codec.queueInputBuffer(
+                                inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                            )
+                            inputDone = true
+                        } else {
+                            codec.queueInputBuffer(inIdx, 0, size, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
+                    }
+                }
+
+                val outIdx = codec.dequeueOutputBuffer(info, 10_000)
+                if (outIdx >= 0) {
+                    // render=true pushes frame to ImageReader surface
+                    codec.releaseOutputBuffer(outIdx, true)
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        outDone = true
+                    }
+                }
+            }
+            Log.d(TAG, "🎬 Video decode thread exiting (vvRunning=$vvRunning)")
+        }.apply {
+            name     = "VideoShareVideoDecode"
+            isDaemon = true
+        }
+    }
+
+    private fun stopVideoShareVideoInternal() {
+        vvRunning = false
+        val t = vvThread
+        vvThread = null
+        try { t?.join(500) } catch (_: InterruptedException) {}
+        runCatching { vvCodec?.stop();    vvCodec?.release() }
+        runCatching { vvExtractor?.release() }
+        runCatching { vvImageReader?.close() }
+        vvCodec      = null
+        vvExtractor  = null
+        vvImageReader = null
+        currentVideoBitmap?.recycle()
+        currentVideoBitmap = null
+        Log.d(TAG, "🛑 Video share video decode stopped")
+    }
+
+    // ── Video share: AUDIO decode internals ──────────────────────────────────
 
     private fun startVideoShareAudioInternal(filePath: String) {
         val extractor = MediaExtractor()
         extractor.setDataSource(filePath)
 
-        // Find audio track
         var audioIdx   = -1
         var mime       = ""
         var sampleRate = 44100
@@ -306,11 +480,8 @@ class MainActivity : FlutterFragmentActivity() {
         codec.configure(extractor.getTrackFormat(audioIdx), null, null, 0)
         codec.start()
 
-        val chCfg = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO
-                    else AudioFormat.CHANNEL_OUT_STEREO
-        val minBuf = AudioTrack.getMinBufferSize(
-            sampleRate, chCfg, AudioFormat.ENCODING_PCM_16BIT
-        )
+        val chCfg  = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+        val minBuf = AudioTrack.getMinBufferSize(sampleRate, chCfg, AudioFormat.ENCODING_PCM_16BIT)
         val speaker = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -336,13 +507,12 @@ class MainActivity : FlutterFragmentActivity() {
         vsSpeaker   = speaker
         vsRunning   = true
 
-        vsThread = buildDecodeThread()
+        vsThread = buildAudioDecodeThread()
         vsThread?.start()
         Log.d(TAG, "✅ Video share audio decode started: $filePath")
     }
 
-    /** Builds (but does not start) the decode thread. Call .start() separately. */
-    private fun buildDecodeThread(): Thread {
+    private fun buildAudioDecodeThread(): Thread {
         val extractor = vsExtractor!!
         val codec     = vsCodec!!
         val speaker   = vsSpeaker!!
@@ -353,16 +523,13 @@ class MainActivity : FlutterFragmentActivity() {
             var outDone   = false
 
             while (vsRunning && !outDone) {
-                // Feed compressed data into codec
                 if (!inputDone) {
                     val inIdx = codec.dequeueInputBuffer(10_000)
                     if (inIdx >= 0) {
                         val buf  = codec.getInputBuffer(inIdx)!!
                         val size = extractor.readSampleData(buf, 0)
                         if (size < 0) {
-                            codec.queueInputBuffer(
-                                inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                            )
+                            codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             inputDone = true
                         } else {
                             codec.queueInputBuffer(inIdx, 0, size, extractor.sampleTime, 0)
@@ -371,20 +538,17 @@ class MainActivity : FlutterFragmentActivity() {
                     }
                 }
 
-                // Drain decoded PCM
                 val outIdx = codec.dequeueOutputBuffer(info, 10_000)
                 if (outIdx >= 0) {
-                    val buf   = codec.getOutputBuffer(outIdx)!!
-                    val pcm   = ByteArray(info.size)
+                    val buf = codec.getOutputBuffer(outIdx)!!
+                    val pcm = ByteArray(info.size)
                     buf.get(pcm)
                     codec.releaseOutputBuffer(outIdx, false)
 
                     if (pcm.isNotEmpty()) {
-                        // 1️⃣  Local speaker
                         if (speaker.playState == AudioTrack.PLAYSTATE_PLAYING) {
                             speaker.write(pcm, 0, pcm.size)
                         }
-                        // 2️⃣  Send PCM to Dart → DataChannel → remote peer
                         runOnUiThread {
                             vsChannel?.invokeMethod("onVideoShareAudioPCM", pcm)
                         }
@@ -410,8 +574,6 @@ class MainActivity : FlutterFragmentActivity() {
         vsRunning = false
         val t = vsThread
         vsThread = null
-        // Wait for decode thread to exit before releasing codec
-        // to prevent IllegalStateException on queueInputBuffer
         try { t?.join(500) } catch (_: InterruptedException) {}
         runCatching { vsCodec?.stop();    vsCodec?.release() }
         runCatching { vsExtractor?.release() }
@@ -428,6 +590,7 @@ class MainActivity : FlutterFragmentActivity() {
         super.onDestroy()
         ScreenShareForegroundService.audioDataChannelCallback = null
         stopVideoShareAudioInternal()
+        stopVideoShareVideoInternal()
         if (screenServiceBound) {
             try { unbindService(screenServiceConnection) } catch (_: Exception) {}
             screenServiceBound = false
