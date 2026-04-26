@@ -230,6 +230,7 @@ class WebRTCService {
   Future<void> setRemoteDescription(RTCSessionDescription desc) async {
     await _peerConnection!.setRemoteDescription(desc);
     _remoteDescriptionSet = true;
+    _isNegotiating = false; // ← add this line here too
     for (final c in List.of(_pendingCandidates)) {
       try {
         await _peerConnection!.addCandidate(c);
