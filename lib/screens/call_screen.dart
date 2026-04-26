@@ -214,6 +214,7 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   Future<void> _createOffer() async {
+    _webrtc.isNegotiating = true; // claim the lock for manual offer
     final offer = await _webrtc.createOffer();
     _signaling.sendOffer(offer.sdp!);
   }

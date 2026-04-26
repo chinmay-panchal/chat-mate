@@ -112,12 +112,20 @@ class WebRTCService {
         debugPrint('⏭️ Skipping renegotiation — already in progress');
         return;
       }
+      // Don't fire during initial setup before peer has joined
+      if (!_isInitiator) return;
+      final sigState = await _peerConnection?.getSignalingState();
+      if (sigState != RTCSignalingState.RTCSignalingStateStable) {
+        debugPrint('⏭️ Skipping renegotiation — not stable ($sigState)');
+        return;
+      }
       _isNegotiating = true;
       debugPrint('🔄 renegotiation needed');
       try {
-        if (_isInitiator) await onNegotiationNeeded?.call();
-      } finally {
-        // Keep locked until answer is received — reset via isNegotiating setter
+        await onNegotiationNeeded?.call();
+      } catch (e) {
+        debugPrint('❌ onNegotiationNeeded error: $e');
+        _isNegotiating = false;
       }
     };
 
